@@ -128,6 +128,7 @@ const COMMANDS_WITH_CONSENT = {
     'scriptjs minikube/manage-minikube.js',
   ],
   headlamp_ai_assistant: ['gh auth', 'az account', 'az cognitiveservices'],
+  aksarc_wsl: ['scriptjs aksarc-wsl/manage-aksarc-wsl.js'],
 };
 
 /**
@@ -161,6 +162,11 @@ export function addRunCmdConsent(pluginInfo: { name: string }): void {
     commands = COMMANDS_WITH_CONSENT.headlamp_ai_assistant;
   }
 
+  const pluginIsAksArcWsl = pluginInfo.name === 'aksarc-wsl';
+  if (pluginIsAksArcWsl) {
+    commands = COMMANDS_WITH_CONSENT.aksarc_wsl;
+  }
+
   for (const command of commands) {
     if (!settings.confirmedCommands[command]) {
       settings.confirmedCommands[command] = true;
@@ -192,6 +198,9 @@ export function removeRunCmdConsent(pluginName: string): void {
     pluginName === '@headlamp-k8s/ai-assistantprerelease'
   ) {
     commands = COMMANDS_WITH_CONSENT.headlamp_ai_assistant;
+  }
+  if (pluginName === 'aksarc-wsl') {
+    commands = COMMANDS_WITH_CONSENT.aksarc_wsl;
   }
   for (const command of commands) {
     delete settings.confirmedCommands[command];
@@ -398,6 +407,7 @@ export function setupRunCmdHandlers(mainWindow: BrowserWindow | null, ipcMain: E
     'runCmd-scriptjs-minikube/manage-minikube.js': cryptoRandom(),
     'runCmd-scriptjs-headlamp_minikube/manage-minikube.js': cryptoRandom(),
     'runCmd-scriptjs-headlamp_minikubeprerelease/manage-minikube.js': cryptoRandom(),
+    'runCmd-scriptjs-aksarc-wsl/manage-aksarc-wsl.js': cryptoRandom(),
     'runCmd-gh': cryptoRandom(),
     'runCmd-az': cryptoRandom(),
   };

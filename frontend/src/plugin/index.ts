@@ -619,6 +619,12 @@ export async function fetchAndExecutePlugins(
             secretsToReturn['runCmd-az'] = secrets['runCmd-az'];
           }
 
+          if (isPackage['aksarc-wsl']) {
+            secretsToReturn['runCmd-scriptjs-aksarc-wsl/manage-aksarc-wsl.js'] =
+              secrets['runCmd-scriptjs-aksarc-wsl/manage-aksarc-wsl.js'];
+            secretsToReturn['runCmd-az'] = secrets['runCmd-az'];
+          }
+
           return secretsToReturn;
         },
         getArgValues: (pluginName, pluginPath, allowedPermissions) => {
@@ -651,6 +657,27 @@ export async function fetchAndExecutePlugins(
           if (isPackage['@headlamp-k8s/ai-assistant']) {
             function pluginRunCommand(
               command: 'gh' | 'az',
+              args: string[],
+              options: {}
+            ): ReturnType<typeof internalRunCommand> {
+              return internalRunCommand(
+                command,
+                args,
+                options,
+                allowedPermissions,
+                pluginDesktopApiSend,
+                pluginDesktopApiReceive
+              );
+            }
+            return [
+              ['pluginRunCommand', 'pluginPath'],
+              [pluginRunCommand, pluginPath],
+            ];
+          }
+
+          if (isPackage['aksarc-wsl']) {
+            function pluginRunCommand(
+              command: 'scriptjs' | 'az',
               args: string[],
               options: {}
             ): ReturnType<typeof internalRunCommand> {

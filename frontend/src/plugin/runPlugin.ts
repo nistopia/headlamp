@@ -208,6 +208,11 @@ export function identifyPackages(
       'user-plugins/headlamp_ai-assistantprerelease',
       'static-plugins/headlamp_ai-assistantprerelease',
     ],
+    'aksarc-wsl': [
+      'plugins/aksarc-wsl',
+      'user-plugins/aksarc-wsl',
+      'static-plugins/aksarc-wsl',
+    ],
   };
 
   if (isDevelopmentMode) {
@@ -224,6 +229,7 @@ export function identifyPackages(
       '@headlamp-k8s/ai-assistant',
       '@headlamp-k8s/ai-assistantprerelease',
     ],
+    'aksarc-wsl': ['aksarc-wsl'],
   };
   const isPackage: Record<string, boolean> = {};
   for (const key in pluginPaths) {
