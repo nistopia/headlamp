@@ -28,3 +28,6 @@ storybook-static
 .eslintcache
 
 /dist
+
+# internal aksarc CLI wheel - bundled locally, not committed
+scripts/*.whl

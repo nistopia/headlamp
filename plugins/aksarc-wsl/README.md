@@ -127,4 +127,16 @@ robocopy dist "$env:APPDATA\Headlamp\Config\plugins\aksarc-wsl" /E
 Restart the app (or, in `make run-app` watch mode, reload). Open **AKS Arc on WSL**
 on the Home sidebar. The first Create/Delete run shows a one-time consent dialog.
 
+## Bundled aksarc CLI wheel
+
+If an aksarc CLI wheel (`*.whl`) is placed in `scripts/`, the runtime script
+auto-detects it, converts its path to the WSL `/mnt/...` form, and sets
+`AKSARC_WHEEL_PATH` — so the UI does **not** ask for a wheel path. If no wheel is
+bundled, the setup script just verifies the currently-installed `az aksarc`
+extension (and fails if it lacks `--network-policy`).
+
+> The wheel is **gitignored** (`scripts/*.whl`) because it is an internal build —
+> it is bundled into the local install but never committed/pushed. Anyone else
+> building the plugin must drop their own `aksarc-*.whl` into `scripts/`.
+
 ## Keeping the bundled scripts in sync

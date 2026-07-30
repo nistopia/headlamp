@@ -4,8 +4,9 @@
 
 .DESCRIPTION
     Drives the WSL edge-node lifecycle from the Windows host so it survives the
-    `wsl --shutdown` that enabling systemd requires (an in-WSL script cannot
-    restart its own PID 1 and keep running -- the host process can).
+    `wsl --terminate <distro>` that enabling systemd requires (an in-WSL script
+    cannot restart its own PID 1 and keep running -- the host process can). Only
+    the dedicated distro is terminated, so other WSL distros stay running.
 
     Two main verbs, each with optional subverbs:
 
@@ -230,9 +231,9 @@ function Ensure-SystemdPid1 {
         Write-Step "systemd already PID 1 -- no restart needed"
         return
     }
-    Write-Step "Restarting WSL to apply systemd (wsl --shutdown)"
-    wsl.exe --shutdown
-    Throw-IfFailed "wsl --shutdown"
+    Write-Step "Restarting distro '$Distro' to apply systemd (wsl --terminate $Distro)"
+    wsl.exe --terminate $Distro
+    Throw-IfFailed "wsl --terminate $Distro"
     Start-Sleep -Seconds 3
     if (-not (Test-SystemdPid1)) {
         $pid1 = (wsl.exe -d $Distro -- ps -p 1 -o comm= 2>$null | Out-String).Trim()
@@ -244,12 +245,40 @@ function Ensure-SystemdPid1 {
 function Ensure-AzLogin {
     # Drive `az login` inside the distro (as root, since provision runs as root)
     # instead of failing the provision prereq check and making the user re-run.
-    if (wsl.exe -d $Distro -u root -- az account show 2>$null) {
+    # NOTE: `az account show` writes "Please run 'az login'" to stderr when logged
+    # out. With the script-level $ErrorActionPreference = 'Stop', PowerShell turns
+    # that native stderr into a TERMINATING NativeCommandError before we can branch
+    # to the login path -- and a plain 2>&1/2>$null redirect does NOT prevent it on
+    # PS 5.1. So we locally set EAP=SilentlyContinue, redirect all streams, and
+    # gate on $LASTEXITCODE (also guarded by try/catch for total safety).
+    $loggedIn = $false
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        wsl.exe -d $Distro -u root -- az account show --only-show-errors *> $null
+        $loggedIn = ($LASTEXITCODE -eq 0)
+    } catch {
+        $loggedIn = $false
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+
+    if ($loggedIn) {
         Write-Step "az already logged in (root context)"
     } else {
         Write-Step "az not logged in -- launching device-code login (root context)"
         Write-Host "    Open the URL below and enter the code to sign in." -ForegroundColor Yellow
-        wsl.exe -d $Distro -u root -- az login --use-device-code
+        # `az login --use-device-code` prints the device-code prompt to stderr.
+        # Under EAP='Stop' that native stderr would terminate before login can
+        # finish, so run under EAP='Continue' and merge stderr->stdout (2>&1) so
+        # the code stays VISIBLE in the streamed log. Gate success on exit code.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            wsl.exe -d $Distro -u root -- az login --use-device-code 2>&1 | Write-Host
+        } finally {
+            $ErrorActionPreference = $prevEAP
+        }
         Throw-IfFailed "az login"
     }
     # Pin the subscription from the config (CMP_SUB) so provision targets the
@@ -348,7 +377,12 @@ function Get-EnvValue {
     $line = $Lines | Where-Object { $_ -match "^\s*$([regex]::Escape($Key))=" } | Select-Object -First 1
     if (-not $line) { return "" }
     $v = ($line -replace "^\s*$([regex]::Escape($Key))=", "").Trim()
-    if ($v.Length -ge 2 -and $v[0] -eq '"' -and $v[-1] -eq '"') { $v = $v.Substring(1, $v.Length - 2) }
+    # Strip a matching pair of surrounding quotes (single OR double). The config
+    # file is bash-sourced, so values may be single-quoted (e.g. paths with
+    # spaces) -- those quotes must not leak into `az ... --subscription`.
+    if ($v.Length -ge 2 -and (($v[0] -eq '"' -and $v[-1] -eq '"') -or ($v[0] -eq "'" -and $v[-1] -eq "'"))) {
+        $v = $v.Substring(1, $v.Length - 2)
+    }
     return $v
 }
 function Set-EnvValue {

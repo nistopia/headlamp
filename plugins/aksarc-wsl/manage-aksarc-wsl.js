@@ -57,9 +57,44 @@ const KNOWN_KEYS = [
   'ENABLE_BMAGENT_HOTSWAP',
 ];
 
-// Values are validated to be single-line, shell-safe tokens before being
-// written to the env file. This blocks newline / command-injection attempts.
-const VALUE_RE = /^[A-Za-z0-9 ._:/\\@+=-]*$/;
+// Values are wrapped in shell single quotes when written to the env file, so
+// paths with spaces/parentheses (e.g. OneDrive paths) survive `source`. We only
+// reject newline/null to prevent injecting extra lines into the env file.
+const FORBIDDEN_RE = /[\r\n\0]/;
+
+/** Shell single-quote a value so it is preserved literally when sourced. */
+function shSingleQuote(v) {
+  return "'" + String(v).replace(/'/g, "'\\''") + "'";
+}
+
+/**
+ * Convert a Windows path (C:\a\b) to its WSL drvfs form (/mnt/c/a/b) so it can
+ * be handed to `az extension add --source` running inside the WSL distro.
+ * Non-drive paths are returned unchanged.
+ */
+function winToWslPath(p) {
+  const m = /^([A-Za-z]):[\\/](.*)$/.exec(p);
+  if (!m) {
+    return p;
+  }
+  return '/mnt/' + m[1].toLowerCase() + '/' + m[2].replace(/\\/g, '/');
+}
+
+/**
+ * If an aksarc CLI wheel (*.whl) is bundled in scripts/, return its WSL path so
+ * the setup script installs it. Returns null when none is shipped (the setup
+ * script then just verifies the currently-installed az aksarc extension).
+ */
+function bundledWheelWslPath(scriptsDir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(scriptsDir);
+  } catch {
+    return null;
+  }
+  const whl = entries.find(f => f.toLowerCase().endsWith('.whl'));
+  return whl ? winToWslPath(path.join(scriptsDir, whl)) : null;
+}
 
 function fail(msg) {
   process.stderr.write(`ERROR: ${msg}\n`);
@@ -96,10 +131,10 @@ function serializeEnv(config) {
       value = value ? 'true' : 'false';
     }
     value = String(value);
-    if (!VALUE_RE.test(value)) {
-      fail(`value for ${key} contains disallowed characters`);
+    if (FORBIDDEN_RE.test(value)) {
+      fail(`value for ${key} must be a single line (no newlines)`);
     }
-    lines.push(`${key}=${value}`);
+    lines.push(`${key}=${shSingleQuote(value)}`);
   }
   return lines.join('\n') + '\n';
 }
@@ -113,8 +148,12 @@ function main() {
   }
 
   // Map the plugin action to the orchestrator verb + target.
+  //  - up:   full idempotent bring-up (prepare = distro + systemd + boot
+  //          hardening, then create = provision). Bare `up` so a fresh machine
+  //          works end-to-end; re-runs are idempotent.
+  //  - down: fast cluster delete, keep the WSL node for a quick re-create.
   const verbMap = {
-    up: ['up', 'create'],
+    up: ['up'],
     down: ['down', 'cluster'],
     status: ['status'],
   };
@@ -135,6 +174,14 @@ function main() {
   const ps1 = path.join(scriptsDir, 'aks-arc-on-wsl.ps1');
   if (!fs.existsSync(ps1)) {
     fail(`orchestrator not found at ${ps1}`);
+  }
+
+  // Prefer a bundled aksarc CLI wheel (shipped in scripts/) over anything the
+  // caller passed, so the UI does not need to ask for a wheel path.
+  const wheel = bundledWheelWslPath(scriptsDir);
+  if (wheel) {
+    config.AKSARC_WHEEL_PATH = wheel;
+    process.stdout.write(`>>> Using bundled aksarc CLI wheel: ${wheel}\n`);
   }
 
   // Write the generated wsl-config.env to a per-run temp file with locked-down

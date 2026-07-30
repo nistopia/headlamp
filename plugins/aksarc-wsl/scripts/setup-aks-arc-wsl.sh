@@ -58,6 +58,11 @@ set -a; source "$CONFIG_FILE"; set +a
 DISTRIBUTION="${DISTRIBUTION:-k8s}"
 K8S_VERSION="${K8S_VERSION:?K8S_VERSION must be set in config}"
 
+# Detect the Debian package architecture (amd64 / arm64) so we install native
+# packages/binaries instead of hard-coding amd64. dpkg's names (amd64, arm64)
+# match both the Microsoft apt repo `arch=` value and the dl.k8s.io path segment.
+DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+
 log()  { echo ">>> $*"; }
 warn() { echo "WARN: $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -151,16 +156,18 @@ prep_apt_repos() {
   if [[ ! -f /usr/share/keyrings/microsoft-prod.gpg ]]; then
     curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
       | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" \
-      | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
   fi
+  # Always (re)write the list so the arch is correct even if the key already
+  # existed from an earlier run (e.g. an amd64 pin left over on an arm64 host).
+  echo "deb [arch=${DEB_ARCH} signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" \
+    | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
 
   if [[ ! -f /usr/share/keyrings/fluentbit-keyring.gpg ]]; then
     curl -fsSL https://packages.fluentbit.io/fluentbit.key \
       | sudo gpg --dearmor -o /usr/share/keyrings/fluentbit-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/fluentbit-keyring.gpg] https://packages.fluentbit.io/ubuntu/noble noble main" \
-      | sudo tee /etc/apt/sources.list.d/fluent-bit.list >/dev/null
   fi
+  echo "deb [signed-by=/usr/share/keyrings/fluentbit-keyring.gpg] https://packages.fluentbit.io/ubuntu/noble noble main" \
+    | sudo tee /etc/apt/sources.list.d/fluent-bit.list >/dev/null
   sudo apt-get update
 }
 
@@ -187,8 +194,22 @@ prep_azcli() {
 
 prep_hci_ext_deps() {
   log "[prep] Installing HCI extension dependencies (BMAgent / observability)"
-  sudo apt-get install -y libkmpp aspnetcore-runtime-8.0 dotnet-runtime-8.0 \
+  # Observability + device-management deps (LinuxEdgeObservability etc.). These
+  # are available on both amd64 and arm64 (dotnet from Ubuntu, fluent-bit from
+  # the fluentbit.io repo) and are always required.
+  sudo apt-get install -y aspnetcore-runtime-8.0 dotnet-runtime-8.0 \
                           fluent-bit lttng-tools liblttng-ust1 inotify-tools
+
+  # libkmpp (libkmpp.so.1) was needed by OLDER AksArcBareMetalAgent extension
+  # builds. Microsoft publishes it for amd64 ONLY (no arm64 Ubuntu .deb exists;
+  # its SymCrypt dep isn't packaged for arm64 Ubuntu). Per the BMAgent owner the
+  # LATEST extension no longer requires it, so on arm64 we skip it rather than
+  # fail. On amd64 we still install it to preserve behaviour for older CMPs.
+  if [[ "$DEB_ARCH" == "amd64" ]]; then
+    sudo apt-get install -y libkmpp
+  else
+    log "[prep] Skipping libkmpp on $DEB_ARCH (no arm64 build; latest BMAgent extension does not require it)"
+  fi
 }
 
 prep_k8s_tools() {
@@ -214,7 +235,7 @@ prep_prepull_images() {
   local repo="mcr.microsoft.com/oss/v2/kubernetes"
   local kubeadm=/tmp/kubeadm-prepull
 
-  curl -fsSL --output "$kubeadm" "https://dl.k8s.io/release/${ver}/bin/linux/amd64/kubeadm"
+  curl -fsSL --output "$kubeadm" "https://dl.k8s.io/release/${ver}/bin/linux/${DEB_ARCH}/kubeadm"
   chmod +x "$kubeadm"
 
   # Pull each image kubeadm expects (skip etcd; BMAgent rewrites the tag — pulled explicitly below).

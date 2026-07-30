@@ -67,7 +67,6 @@ interface AksArcWslConfig {
   EDGE_LOCATION: string;
   TENANT_ID: string;
   K8S_VERSION: string;
-  AKSARC_WHEEL_PATH: string;
   ENABLE_GPU: boolean;
   ENABLE_BMAGENT_HOTSWAP: boolean;
 }
@@ -82,7 +81,6 @@ const DEFAULT_CONFIG: AksArcWslConfig = {
   EDGE_LOCATION: 'eastus2euap',
   TENANT_ID: '',
   K8S_VERSION: '1.33.3-20251001',
-  AKSARC_WHEEL_PATH: '',
   ENABLE_GPU: false,
   ENABLE_BMAGENT_HOTSWAP: false,
 };
@@ -183,11 +181,6 @@ function CreateAksArcOnWsl() {
     { key: 'EDGE_LOCATION', label: 'Edge location' },
     { key: 'TENANT_ID', label: 'Tenant ID', required: true },
     { key: 'K8S_VERSION', label: 'Kubernetes version', required: true },
-    {
-      key: 'AKSARC_WHEEL_PATH',
-      label: 'aksarc CLI wheel path (optional)',
-      helper: 'Leave blank to use the published az aksarc extension.',
-    },
   ];
 
   return (
@@ -195,6 +188,8 @@ function CreateAksArcOnWsl() {
       <Typography variant="body2" color="textSecondary" paragraph>
         Provision an AKS Arc (SFF/BareMetal) edge cluster using WSL2 as the edge node. This drives
         the hardened <code>aks-arc-on-wsl.ps1</code> orchestrator in a WSL distro on this machine.
+        The first run also prepares the WSL node (creates the distro, enables systemd, applies boot
+        hardening) before provisioning; re-runs are idempotent.
       </Typography>
 
       {!isDesktop && (
@@ -246,18 +241,6 @@ function CreateAksArcOnWsl() {
                 />
               }
               label="Enable GPU"
-            />
-          </Grid>
-          <Grid item xs={12} sm={6}>
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={config.ENABLE_BMAGENT_HOTSWAP}
-                  onChange={e => setField('ENABLE_BMAGENT_HOTSWAP', e.target.checked)}
-                  disabled={running}
-                />
-              }
-              label="Enable BMAgent hot-swap (required for k3s)"
             />
           </Grid>
         </Grid>
@@ -333,6 +316,7 @@ registerRoute({
     sidebar: 'HOME',
   },
   useClusterURL: false,
+  noAuthRequired: true,
   name: 'aksarc-wsl',
   exact: true,
   component: () => <CreateAksArcOnWsl />,
