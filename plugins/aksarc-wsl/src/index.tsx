@@ -20,14 +20,8 @@ import {
   Alert,
   Box,
   Button,
-  Checkbox,
-  FormControl,
-  FormControlLabel,
   Grid,
-  InputLabel,
-  MenuItem,
   Paper,
-  Select,
   Stack,
   TextField,
   Typography,
@@ -58,34 +52,20 @@ const SCRIPT = 'aksarc-wsl/manage-aksarc-wsl.js';
 
 /** The configuration collected from the form. Mirrors wsl-config.env keys. */
 interface AksArcWslConfig {
-  DISTRIBUTION: string;
-  CMP_SUB: string;
-  CMP_RG: string;
-  CMP_AKS: string;
-  CMP_CONN: string;
-  CMP_LOCATION: string;
-  EDGE_LOCATION: string;
+  SUBSCRIPTION: string;
+  RESOURCE_GROUP: string;
   TENANT_ID: string;
-  K8S_VERSION: string;
-  ENABLE_GPU: boolean;
-  ENABLE_BMAGENT_HOTSWAP: boolean;
+  LOCATION: string;
 }
 
 const DEFAULT_CONFIG: AksArcWslConfig = {
-  DISTRIBUTION: 'k8s',
-  CMP_SUB: '',
-  CMP_RG: '',
-  CMP_AKS: 'aks-cl',
-  CMP_CONN: 'aks-conn-cl',
-  CMP_LOCATION: 'eastus2euap',
-  EDGE_LOCATION: 'eastus2euap',
+  SUBSCRIPTION: '',
+  RESOURCE_GROUP: '',
   TENANT_ID: '',
-  K8S_VERSION: '1.33.3-20251001',
-  ENABLE_GPU: false,
-  ENABLE_BMAGENT_HOTSWAP: false,
+  LOCATION: 'eastus',
 };
 
-const STORAGE_KEY = 'aksarc-wsl-config';
+const STORAGE_KEY = 'aksarc-wsl-deploy-config';
 
 /** Base64-encode a JSON payload so it survives argv without quoting issues. */
 function encodePayload(obj: unknown): string {
@@ -93,14 +73,7 @@ function encodePayload(obj: unknown): string {
 }
 
 /** The required fields that must be filled before create/delete is allowed. */
-const REQUIRED_FIELDS: (keyof AksArcWslConfig)[] = [
-  'CMP_SUB',
-  'CMP_RG',
-  'CMP_AKS',
-  'CMP_CONN',
-  'TENANT_ID',
-  'K8S_VERSION',
-];
+const REQUIRED_FIELDS: (keyof AksArcWslConfig)[] = ['SUBSCRIPTION', 'RESOURCE_GROUP', 'TENANT_ID'];
 
 function CreateAksArcOnWsl() {
   const [config, setConfig] = useState<AksArcWslConfig>(() => {
@@ -181,7 +154,7 @@ function CreateAksArcOnWsl() {
     });
   };
 
-  const run = (action: 'up' | 'down' | 'status') => {
+  const run = (action: 'up' | 'down' | 'status' | 'validate') => {
     if (!pluginRunCommand) {
       append('ERROR: This action only works in the Headlamp desktop app.\n');
       return;
@@ -192,7 +165,7 @@ function CreateAksArcOnWsl() {
     }
     setRunning(true);
     setExitCode(undefined);
-    setLog(`>>> aksarc-wsl: ${action} (this can take 15-30 minutes)\n`);
+    setLog(`>>> aksarc-wsl: ${action}\n`);
 
     const payload = encodePayload(config);
     const proc = pluginRunCommand('scriptjs', [SCRIPT, action, payload], {});
@@ -214,23 +187,24 @@ function CreateAksArcOnWsl() {
     required?: boolean;
     helper?: string;
   }[] = [
-    { key: 'CMP_SUB', label: 'CMP Subscription ID', required: true },
-    { key: 'CMP_RG', label: 'CMP Resource Group', required: true },
-    { key: 'CMP_AKS', label: 'CMP AKS cluster name', required: true },
-    { key: 'CMP_CONN', label: 'CMP connected-cluster name', required: true },
-    { key: 'CMP_LOCATION', label: 'CMP location' },
-    { key: 'EDGE_LOCATION', label: 'Edge location' },
+    { key: 'SUBSCRIPTION', label: 'Subscription ID', required: true },
+    {
+      key: 'RESOURCE_GROUP',
+      label: 'Resource group (must be in eastus)',
+      required: true,
+      helper: 'Created if it does not exist. Public preview supports eastus only.',
+    },
     { key: 'TENANT_ID', label: 'Tenant ID', required: true },
-    { key: 'K8S_VERSION', label: 'Kubernetes version', required: true },
+    { key: 'LOCATION', label: 'Region', helper: 'Public preview: eastus only.' },
   ];
 
   return (
     <SectionBox title="Create AKS Arc on WSL" textAlign="left" paddingTop={2}>
       <Typography variant="body2" color="textSecondary" paragraph>
-        Provision an AKS Arc (SFF/BareMetal) edge cluster using WSL2 as the edge node. This drives
-        the hardened <code>aks-arc-on-wsl.ps1</code> orchestrator in a WSL distro on this machine.
-        The first run also prepares the WSL node (creates the distro, enables systemd, applies boot
-        hardening) before provisioning; re-runs are idempotent.
+        Provision an AKS Arc (BareMetal, Azure Arc-connected) cluster using WSL2 as the edge node,
+        via the public <code>az aksarc deploy</code> flow (no dev CMP). The first run prepares the
+        WSL node (distro, systemd, boot hardening), Arc-enables it, and runs <code>az aksarc deploy</code>.
+        Requires a preview-enrolled subscription and an <b>eastus</b> resource group.
       </Typography>
 
       {!isDesktop && (
@@ -242,21 +216,6 @@ function CreateAksArcOnWsl() {
 
       <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
         <Grid container spacing={2}>
-          <Grid item xs={12} sm={6}>
-            <FormControl fullWidth size="small">
-              <InputLabel id="distribution-label">Distribution</InputLabel>
-              <Select
-                labelId="distribution-label"
-                label="Distribution"
-                value={config.DISTRIBUTION}
-                onChange={e => setField('DISTRIBUTION', e.target.value)}
-                disabled={running}
-              >
-                <MenuItem value="k8s">k8s (kubeadm)</MenuItem>
-                <MenuItem value="k3s">k3s</MenuItem>
-              </Select>
-            </FormControl>
-          </Grid>
           {fields.map(f => (
             <Grid item xs={12} sm={6} key={f.key}>
               <TextField
@@ -272,21 +231,17 @@ function CreateAksArcOnWsl() {
               />
             </Grid>
           ))}
-          <Grid item xs={12} sm={6}>
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={config.ENABLE_GPU}
-                  onChange={e => setField('ENABLE_GPU', e.target.checked)}
-                  disabled={running}
-                />
-              }
-              label="Enable GPU"
-            />
-          </Grid>
         </Grid>
 
         <Stack direction="row" spacing={2} sx={{ mt: 2 }}>
+          <Button
+            variant="outlined"
+            color="primary"
+            disabled={!isDesktop || running || missing.length > 0}
+            onClick={() => run('validate')}
+          >
+            Validate (dry-run)
+          </Button>
           <Button
             variant="contained"
             color="primary"
@@ -364,8 +319,9 @@ registerAddClusterProvider({
   title: 'AKS Arc BareMetal (connected) — WSL',
   icon: AksArcWslIcon,
   description:
-    'Provision an AKS Arc (SFF/BareMetal, Azure Arc-connected) edge cluster using ' +
-    'WSL2 as the edge node. Drives the hardened aks-arc-on-wsl.ps1 orchestrator on ' +
-    'this machine, then registers the new cluster in Headlamp. Windows desktop app only.',
+    'Provision an AKS Arc (BareMetal, Azure Arc-connected) cluster using WSL2 as the ' +
+    'edge node, via the public `az aksarc deploy` flow. Prepares the WSL node, ' +
+    'Arc-enables it, deploys, then registers the cluster in Headlamp. Requires a ' +
+    'preview-enrolled subscription + eastus RG. Windows desktop app only.',
   url: '/aksarc-wsl',
 });

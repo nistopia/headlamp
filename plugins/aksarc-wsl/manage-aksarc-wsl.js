@@ -15,108 +15,58 @@
  */
 
 /*
- * manage-aksarc-wsl.js
+ * manage-aksarc-wsl.js  (deploy branch)
  *
- * Runtime helper shipped with the `aksarc-wsl` Headlamp plugin. It is executed
- * by the Headlamp desktop app via the `scriptjs` run-command mechanism
- * (see app/electron/runCmd.ts), which runs it with the app/Electron binary as
- * the Node runtime -- so no separate Node install is required.
+ * Node.js orchestrator for the PUBLIC `az aksarc deploy` flow on WSL. It runs on
+ * the Headlamp app/Electron node runtime (via the `scriptjs` run-command) and
+ * replaces the previous PowerShell orchestrator entirely: it drives wsl.exe
+ * directly to create the distro, apply systemd (which requires a restart from
+ * OUTSIDE the distro), and run the bundled bash phases
+ * (setup-aks-arc-deploy.sh) that do the OS prep and `az aksarc deploy`.
  *
- * It reuses the hardened Windows orchestrator `aks-arc-on-wsl.ps1` (bundled in
- * ./scripts) rather than reimplementing the WSL/az bring-up logic.
- *
- * Invocation (from the plugin UI):
  *   scriptjs aksarc-wsl/manage-aksarc-wsl.js <action> <base64-json-config>
- *
- *   action = up | down | status
- *
- * All stdout/stderr is streamed back to the plugin UI in real time.
+ *   action = up | down | status | kubeconfig | validate
  */
 
 'use strict';
 
 const { spawn } = require('child_process');
-const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
-// The dedicated WSL distro the orchestrator creates/uses (aks-arc-on-wsl.ps1
-// -Distro default). The kubeconfig lives in this distro.
+// Dedicated WSL distro + base image for the edge node.
 const DISTRO = 'aks-edge';
+const BASE_DISTRO = 'Ubuntu-24.04';
+// Staging dir inside the distro.
+const STAGE = '~/.aksarc-deploy';
 
-// wsl-config.env keys we know how to serialize. Anything else in the payload
-// is ignored so the UI can never inject arbitrary lines into the env file.
+// deploy-config.env keys the bash script understands. Anything else is ignored.
 const KNOWN_KEYS = [
-  'DISTRIBUTION',
-  'CMP_SUB',
-  'CMP_RG',
-  'CMP_AKS',
-  'CMP_CONN',
-  'CMP_LOCATION',
-  'EDGE_LOCATION',
+  'SUBSCRIPTION',
+  'RESOURCE_GROUP',
   'TENANT_ID',
-  'K8S_VERSION',
-  'AKSARC_WHEEL_PATH',
-  'ENABLE_GPU',
-  'ENABLE_BMAGENT_HOTSWAP',
+  'LOCATION',
+  'AKSARC_WHEEL_URL',
+  'VALIDATE_ONLY',
 ];
-
-// Values are wrapped in shell single quotes when written to the env file, so
-// paths with spaces/parentheses (e.g. OneDrive paths) survive `source`. We only
-// reject newline/null to prevent injecting extra lines into the env file.
 const FORBIDDEN_RE = /[\r\n\0]/;
 
-/** Shell single-quote a value so it is preserved literally when sourced. */
-function shSingleQuote(v) {
-  return "'" + String(v).replace(/'/g, "'\\''") + "'";
+function log(msg) {
+  process.stdout.write(msg.endsWith('\n') ? msg : msg + '\n');
 }
-
-/**
- * Convert a Windows path (C:\a\b) to its WSL drvfs form (/mnt/c/a/b) so it can
- * be handed to `az extension add --source` running inside the WSL distro.
- * Non-drive paths are returned unchanged.
- */
-function winToWslPath(p) {
-  const m = /^([A-Za-z]):[\\/](.*)$/.exec(p);
-  if (!m) {
-    return p;
-  }
-  return '/mnt/' + m[1].toLowerCase() + '/' + m[2].replace(/\\/g, '/');
-}
-
-/**
- * If an aksarc CLI wheel (*.whl) is bundled in scripts/, return its WSL path so
- * the setup script installs it. Returns null when none is shipped (the setup
- * script then just verifies the currently-installed az aksarc extension).
- */
-function bundledWheelWslPath(scriptsDir) {
-  let entries;
-  try {
-    entries = fs.readdirSync(scriptsDir);
-  } catch {
-    return null;
-  }
-  const whl = entries.find(f => f.toLowerCase().endsWith('.whl'));
-  return whl ? winToWslPath(path.join(scriptsDir, whl)) : null;
-}
-
 function fail(msg) {
   process.stderr.write(`ERROR: ${msg}\n`);
   process.exit(1);
 }
+function shSingleQuote(v) {
+  return "'" + String(v).replace(/'/g, "'\\''") + "'";
+}
 
 function parseConfig(b64) {
-  let json;
-  try {
-    json = Buffer.from(b64, 'base64').toString('utf8');
-  } catch (e) {
-    fail(`could not base64-decode config: ${e.message}`);
-  }
   let obj;
   try {
-    obj = JSON.parse(json);
+    obj = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
   } catch (e) {
-    fail(`config is not valid JSON: ${e.message}`);
+    fail(`config is not valid base64 JSON: ${e.message}`);
   }
   if (!obj || typeof obj !== 'object') {
     fail('config must be a JSON object');
@@ -136,122 +86,213 @@ function serializeEnv(config) {
     }
     value = String(value);
     if (FORBIDDEN_RE.test(value)) {
-      fail(`value for ${key} must be a single line (no newlines)`);
+      fail(`value for ${key} must be a single line`);
     }
     lines.push(`${key}=${shSingleQuote(value)}`);
   }
   return lines.join('\n') + '\n';
 }
 
-function main() {
-  const action = process.argv[2];
-  const payload = process.argv[3];
-
-  if (!action || !payload) {
-    fail('usage: manage-aksarc-wsl.js <up|down|status|kubeconfig> <base64-config>');
+/** Convert a Windows path (C:\a\b) to its WSL drvfs form (/mnt/c/a/b). */
+function winToWslPath(p) {
+  const m = /^([A-Za-z]):[\\/](.*)$/.exec(p);
+  if (!m) {
+    return p;
   }
+  return '/mnt/' + m[1].toLowerCase() + '/' + m[2].replace(/\\/g, '/');
+}
 
-  if (process.platform !== 'win32') {
-    fail(
-      'AKS Arc on WSL is only supported on Windows (needs wsl.exe + PowerShell). ' +
-        `Detected platform: ${process.platform}.`
-    );
-  }
-
-  // `kubeconfig` streams the cluster's admin.conf out of the WSL distro so the
-  // UI can register it with Headlamp. It does not touch the orchestrator.
-  if (action === 'kubeconfig') {
-    const kc = spawn(
-      'wsl.exe',
-      ['-d', DISTRO, '-u', 'root', '--', 'cat', '/etc/kubernetes/admin.conf'],
-      { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }
-    );
-    kc.stdout.on('data', d => process.stdout.write(d));
-    kc.stderr.on('data', d => process.stderr.write(d));
-    kc.on('error', err => {
-      process.stderr.write(`ERROR: failed to read kubeconfig: ${err.message}\n`);
-      process.exit(1);
+/** Run a command, streaming stdout/stderr; resolves with the exit code. */
+function run(cmd, args, opts = {}) {
+  return new Promise(resolve => {
+    const child = spawn(cmd, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], ...opts });
+    if (opts.input !== undefined) {
+      child.stdin.write(opts.input);
+    }
+    child.stdin.end();
+    child.stdout.on('data', d => process.stdout.write(d));
+    child.stderr.on('data', d => process.stderr.write(d));
+    child.on('error', err => {
+      process.stderr.write(`ERROR: failed to launch ${cmd}: ${err.message}\n`);
+      resolve(-1);
     });
-    kc.on('exit', code => process.exit(code === null ? 1 : code));
+    child.on('exit', code => resolve(code === null ? 1 : code));
+  });
+}
+
+/** Run a command; resolves with { code, out } capturing stdout (still streamed off). */
+function capture(cmd, args) {
+  return new Promise(resolve => {
+    let out = '';
+    const child = spawn(cmd, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.on('data', d => (out += d.toString()));
+    child.stderr.on('data', () => {});
+    child.on('error', () => resolve({ code: -1, out: '' }));
+    child.on('exit', code => resolve({ code: code === null ? 1 : code, out }));
+  });
+}
+
+const wsl = (...args) => run('wsl.exe', args);
+const wslRoot = cmd => run('wsl.exe', ['-d', DISTRO, '-u', 'root', '--', 'bash', '-lc', cmd]);
+
+async function distroExists() {
+  // `wsl -d <name> -- true` exits 0 iff the distro exists.
+  const { code } = await capture('wsl.exe', ['-d', DISTRO, '--', 'true']);
+  return code === 0;
+}
+
+async function systemdIsPid1() {
+  const { code, out } = await capture('wsl.exe', ['-d', DISTRO, '--', 'ps', '-p', '1', '-o', 'comm=']);
+  return code === 0 && out.trim() === 'systemd';
+}
+
+async function ensureDistro() {
+  if (await distroExists()) {
     return;
   }
+  log(`>>> Creating distro '${DISTRO}' from '${BASE_DISTRO}' (--no-launch)`);
+  const code = await wsl('--install', BASE_DISTRO, '--name', DISTRO, '--no-launch');
+  if (code !== 0) {
+    fail(`failed to create distro '${DISTRO}' (exit ${code})`);
+  }
+  await capture('wsl.exe', ['-d', DISTRO, '-u', 'root', '--', 'true']); // first boot
+  if (!(await distroExists())) {
+    fail(`distro '${DISTRO}' still not present after install`);
+  }
+}
 
-  // Map the plugin action to the orchestrator verb + target.
-  //  - up:   full idempotent bring-up (prepare = distro + systemd + boot
-  //          hardening, then create = provision). Bare `up` so a fresh machine
-  //          works end-to-end; re-runs are idempotent.
-  //  - down: fast cluster delete, keep the WSL node for a quick re-create.
-  const verbMap = {
-    up: ['up'],
-    down: ['down', 'cluster'],
-    status: ['status'],
-  };
-  const verbArgs = verbMap[action];
-  if (!verbArgs) {
-    fail(`unknown action '${action}' (expected up | down | status | kubeconfig)`);
+/** Copy the bundled deploy script + write the config into the distro. */
+async function stage(config) {
+  const scriptWin = path.join(__dirname, 'scripts', 'setup-aks-arc-deploy.sh');
+  const scriptWsl = winToWslPath(scriptWin);
+  log('>>> Staging deploy script + config into WSL');
+  let code = await wslRoot(
+    `mkdir -p ${STAGE} && cp ${shSingleQuote(scriptWsl)} ${STAGE}/setup-aks-arc-deploy.sh && ` +
+      `sed -i 's/\\r$//' ${STAGE}/setup-aks-arc-deploy.sh && chmod +x ${STAGE}/setup-aks-arc-deploy.sh`
+  );
+  if (code !== 0) {
+    fail('failed to stage the deploy script into WSL');
+  }
+  // Write the config via stdin (avoids putting secrets on the command line).
+  code = await run(
+    'wsl.exe',
+    ['-d', DISTRO, '-u', 'root', '--', 'bash', '-lc', `umask 077; cat > ${STAGE}/deploy-config.env`],
+    { input: serializeEnv(config) }
+  );
+  if (code !== 0) {
+    fail('failed to write the deploy config into WSL');
+  }
+}
+
+const runPhase = phase =>
+  wslRoot(`cd ${STAGE} && ./setup-aks-arc-deploy.sh --phase ${phase} --config ${STAGE}/deploy-config.env`);
+
+async function actionUp(config) {
+  await ensureDistro();
+  await stage(config);
+
+  log('>>> Phase: prep');
+  if ((await runPhase('prep')) !== 0) {
+    fail('prep phase failed');
   }
 
+  // systemd is applied only on a cold boot of the distro; an in-WSL script
+  // cannot restart its own PID 1, so we terminate it from here (leaves other
+  // distros running) and let the next command re-boot it.
+  if (!(await systemdIsPid1())) {
+    log(`>>> Restarting distro '${DISTRO}' to apply systemd (wsl --terminate)`);
+    await wsl('--terminate', DISTRO);
+    await capture('wsl.exe', ['-d', DISTRO, '-u', 'root', '--', 'true']); // re-boot
+    if (!(await systemdIsPid1())) {
+      fail('systemd is not PID 1 after restart — check /etc/wsl.conf');
+    }
+    log('>>> systemd confirmed as PID 1');
+  }
+
+  log('>>> Phase: deploy');
+  const code = await runPhase('deploy');
+  if (code !== 0) {
+    fail(`deploy phase failed (exit ${code})`);
+  }
+  log('>>> up complete.');
+}
+
+async function actionDown(config) {
+  if (!(await distroExists())) {
+    fail(`distro '${DISTRO}' not present — nothing to delete`);
+  }
+  const rg = config.RESOURCE_GROUP;
+  const machine = '$(hostname -s | tr "[:upper:]" "[:lower:]")';
+  // Cluster-only delete (keep the Arc machine + any reusable infra) for a fast
+  // re-deploy loop: find the provisioned cluster in the RG and delete just it.
+  log('>>> Deleting the provisioned cluster (cluster-only; keeps Arc machine)');
+  const script =
+    `set -e; az account set --subscription ${shSingleQuote(config.SUBSCRIPTION)}; ` +
+    `name=$(az aksarc list -g ${shSingleQuote(rg)} --query "[0].name" -o tsv 2>/dev/null); ` +
+    `if [ -z "$name" ]; then echo ">>> no provisioned cluster found in ${rg}"; exit 0; fi; ` +
+    `echo ">>> deleting cluster $name"; az aksarc delete -g ${shSingleQuote(rg)} -n "$name" --yes`;
+  const code = await wslRoot(script);
+  process.exit(code === null ? 1 : code);
+}
+
+async function actionStatus(config) {
+  if (!(await distroExists())) {
+    log(`distro '${DISTRO}': NOT PRESENT`);
+    return;
+  }
+  await wslRoot(
+    `echo "== distro =="; ps -p 1 -o comm= | sed "s/^/init: /"; ` +
+      `echo "== arc =="; azcmagent show 2>/dev/null | grep -E "Agent Status|Resource Name" || echo "not connected"; ` +
+      `echo "== cluster =="; az aksarc list -g ${shSingleQuote(config.RESOURCE_GROUP)} ` +
+      `--query "[].{name:name,state:provisioningState}" -o table 2>/dev/null || echo "(az not ready / not logged in)"`
+  );
+}
+
+/** Stream the cluster kubeconfig for Headlamp auto-load. */
+async function actionKubeconfig(config) {
+  // Prefer az aksarc get-credentials (works for the RP-managed cluster); fall
+  // back to the node-local admin.conf.
+  const rg = config.RESOURCE_GROUP;
+  const code = await wslRoot(
+    `set -e; az account set --subscription ${shSingleQuote(config.SUBSCRIPTION)} >/dev/null 2>&1 || true; ` +
+      `name=$(az aksarc list -g ${shSingleQuote(rg)} --query "[0].name" -o tsv 2>/dev/null); ` +
+      `if [ -n "$name" ]; then az aksarc get-credentials -g ${shSingleQuote(rg)} -n "$name" --file /tmp/kc >/dev/null 2>&1 && cat /tmp/kc && exit 0; fi; ` +
+      `cat /etc/kubernetes/admin.conf`
+  );
+  process.exit(code === null ? 1 : code);
+}
+
+async function main() {
+  const action = process.argv[2];
+  const payload = process.argv[3];
+  if (!action || !payload) {
+    fail('usage: manage-aksarc-wsl.js <up|down|status|kubeconfig|validate> <base64-config>');
+  }
+  if (process.platform !== 'win32') {
+    fail(`AKS Arc on WSL is only supported on Windows (needs wsl.exe). Detected: ${process.platform}.`);
+  }
   const config = parseConfig(payload);
-  const scriptsDir = path.join(__dirname, 'scripts');
-  const ps1 = path.join(scriptsDir, 'aks-arc-on-wsl.ps1');
-  if (!fs.existsSync(ps1)) {
-    fail(`orchestrator not found at ${ps1}`);
-  }
 
-  // Prefer a bundled aksarc CLI wheel (shipped in scripts/) over anything the
-  // caller passed, so the UI does not need to ask for a wheel path.
-  const wheel = bundledWheelWslPath(scriptsDir);
-  if (wheel) {
-    config.AKSARC_WHEEL_PATH = wheel;
-    process.stdout.write(`>>> Using bundled aksarc CLI wheel: ${wheel}\n`);
-  }
-
-  // Write the generated wsl-config.env to a per-run temp file with locked-down
-  // permissions (it can contain subscription/tenant identifiers).
-  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aksarc-wsl-'));
-  const cfgFile = path.join(cfgDir, 'wsl-config.env');
-  fs.writeFileSync(cfgFile, serializeEnv(config), { mode: 0o600 });
-
-  const psArgs = [
-    '-NoProfile',
-    '-ExecutionPolicy',
-    'Bypass',
-    '-File',
-    ps1,
-    ...verbArgs,
-    '-ConfigFile',
-    cfgFile,
-  ];
-
-  process.stdout.write(`>>> Running: powershell.exe ${verbArgs.join(' ')} (config: ${cfgFile})\n`);
-
-  const child = spawn('powershell.exe', psArgs, {
-    windowsHide: true,
-    // stdout/stderr are piped so we can forward them to the plugin UI stream.
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
-  child.stdout.on('data', d => process.stdout.write(d));
-  child.stderr.on('data', d => process.stderr.write(d));
-
-  child.on('error', err => {
-    process.stderr.write(`ERROR: failed to launch PowerShell: ${err.message}\n`);
-    cleanup(cfgDir);
-    process.exit(1);
-  });
-
-  child.on('exit', code => {
-    cleanup(cfgDir);
-    process.exit(code === null ? 1 : code);
-  });
-}
-
-function cleanup(dir) {
-  try {
-    fs.rmSync(dir, { recursive: true, force: true });
-  } catch {
-    /* best-effort temp cleanup */
+  switch (action) {
+    case 'validate':
+      config.VALIDATE_ONLY = 'true';
+      await actionUp(config);
+      break;
+    case 'up':
+      await actionUp(config);
+      break;
+    case 'down':
+      await actionDown(config);
+      break;
+    case 'status':
+      await actionStatus(config);
+      break;
+    case 'kubeconfig':
+      await actionKubeconfig(config);
+      break;
+    default:
+      fail(`unknown action '${action}' (expected up | down | status | kubeconfig | validate)`);
   }
 }
 
-main();
+main().catch(err => fail(err && err.stack ? err.stack : String(err)));
