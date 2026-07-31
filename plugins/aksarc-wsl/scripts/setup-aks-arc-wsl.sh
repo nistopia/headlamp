@@ -58,16 +58,22 @@ set -a; source "$CONFIG_FILE"; set +a
 DISTRIBUTION="${DISTRIBUTION:-k8s}"
 K8S_VERSION="${K8S_VERSION:?K8S_VERSION must be set in config}"
 
-# Detect the Debian package architecture (amd64 / arm64) so we install native
-# packages/binaries instead of hard-coding amd64. dpkg's names (amd64, arm64)
-# match both the Microsoft apt repo `arch=` value and the dl.k8s.io path segment.
-DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-
 log()  { echo ">>> $*"; }
 warn() { echo "WARN: $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+# Detect the Debian package architecture (amd64 / arm64) so we install native
+# packages/binaries instead of hard-coding amd64. dpkg's names (amd64, arm64)
+# match both the Microsoft apt repo `arch=` value and the dl.k8s.io path segment.
+# Validate to the arches we actually support before using it in repo entries /
+# download URLs.
+DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+case "$DEB_ARCH" in
+  amd64|arm64) ;;
+  *) die "unsupported architecture '$DEB_ARCH' (expected amd64 or arm64)" ;;
+esac
 
 # -----------------------------------------------------------------------------
 # Phase: PREP  (must run before the systemd `wsl --shutdown`)
@@ -193,23 +199,15 @@ prep_azcli() {
 }
 
 prep_hci_ext_deps() {
-  log "[prep] Installing HCI extension dependencies (BMAgent / observability)"
-  # Observability + device-management deps (LinuxEdgeObservability etc.). These
-  # are available on both amd64 and arm64 (dotnet from Ubuntu, fluent-bit from
-  # the fluentbit.io repo) and are always required.
+  log "[prep] Installing HCI extension dependencies (observability / device management)"
+  # Observability + device-management deps (LinuxEdgeObservability etc.), available
+  # on both amd64 and arm64 (dotnet from Ubuntu, fluent-bit from the fluentbit.io
+  # repo). We do NOT install libkmpp: its only consumer was an older BMAgent
+  # extension build, and the current AksArcBareMetalAgent extension (installed by
+  # CAPE at cluster create) no longer requires it. Microsoft also publishes no
+  # arm64 libkmpp .deb.
   sudo apt-get install -y aspnetcore-runtime-8.0 dotnet-runtime-8.0 \
                           fluent-bit lttng-tools liblttng-ust1 inotify-tools
-
-  # libkmpp (libkmpp.so.1) was needed by OLDER AksArcBareMetalAgent extension
-  # builds. Microsoft publishes it for amd64 ONLY (no arm64 Ubuntu .deb exists;
-  # its SymCrypt dep isn't packaged for arm64 Ubuntu). Per the BMAgent owner the
-  # LATEST extension no longer requires it, so on arm64 we skip it rather than
-  # fail. On amd64 we still install it to preserve behaviour for older CMPs.
-  if [[ "$DEB_ARCH" == "amd64" ]]; then
-    sudo apt-get install -y libkmpp
-  else
-    log "[prep] Skipping libkmpp on $DEB_ARCH (no arm64 build; latest BMAgent extension does not require it)"
-  fi
 }
 
 prep_k8s_tools() {
@@ -236,6 +234,14 @@ prep_prepull_images() {
   local kubeadm=/tmp/kubeadm-prepull
 
   curl -fsSL --output "$kubeadm" "https://dl.k8s.io/release/${ver}/bin/linux/${DEB_ARCH}/kubeadm"
+  # Verify against the upstream SHA256 (dl.k8s.io publishes <binary>.sha256 as a
+  # bare hex digest) to reduce supply-chain risk.
+  local expected actual
+  expected="$(curl -fsSL "https://dl.k8s.io/release/${ver}/bin/linux/${DEB_ARCH}/kubeadm.sha256")" \
+    || die "failed to fetch kubeadm.sha256"
+  actual="$(sha256sum "$kubeadm" | cut -d' ' -f1)"
+  [[ "$actual" == "$expected" ]] \
+    || die "kubeadm checksum mismatch (expected $expected, got $actual)"
   chmod +x "$kubeadm"
 
   # Pull each image kubeadm expects (skip etcd; BMAgent rewrites the tag — pulled explicitly below).
@@ -278,16 +284,10 @@ run_prep() {
 # -----------------------------------------------------------------------------
 
 # ---- Constants (read from config; defaults from the guide) ------------------
-C2E_TRUSTED_APP_ID="${C2E_TRUSTED_APP_ID:-89ad4ee6-8387-4829-9ce1-885479863c60}"   # CAPE C2E appId (Step 7)
 EM_API="${EM_API:-2025-12-01-preview}"
 DP_API="${DP_API:-2024-11-01-preview}"
 EXT_API="${EXT_API:-2024-07-10}"
 ARC_API="${ARC_API:-2023-03-15-preview}"
-ADO_RESOURCE_ID="${ADO_RESOURCE_ID:-499b84ac-1321-427f-aa17-267ca6975798}"          # Azure DevOps AAD app
-ADO_BASE_URL="${ADO_BASE_URL:-https://dev.azure.com/msazure/msk8s/_apis}"
-BMAGENT_ARTIFACT="${BMAGENT_ARTIFACT:-drop_unifiedBuild_bmagent}"
-BMAGENT_REPLACE_SCRIPT_PATH="${BMAGENT_REPLACE_SCRIPT_PATH:-/.pipelines/aksarc-bmlinux/scripts/bmagent-replace-phase2.sh}"
-BMAGENT_BUILD_DEFINITION="${BMAGENT_BUILD_DEFINITION:-428700}"                      # unified-build pipeline (hot-swap only)
 DNS="${DNS:-8.8.8.8}"                                                               # LogicalNetwork DNS (schema paperwork on WSL)
 VM_SWITCH="${VM_SWITCH:-wsl-noop}"                                                  # placeholder vm-switch (SFF provisions no VMs)
 # HCI_ROLES is a '|'-delimited list in config; parse into an array here.
@@ -501,35 +501,6 @@ JSON
   die "EdgeMachine did not reach Succeeded in time"
 }
 
-# Step 7 — BMAgent C2E trustedCloudSideAppId patch (best-effort).
-# On the SFF VHD flow HCI RP pre-installs BMAgent (sometimes with the wrong
-# trustedCloudSideAppId), so this patch corrects it. On the WSL/Ubuntu flow HCI
-# RP does NOT pre-install BMAgent — CAPE installs it later during the DevicePool
-# /CustomLocation reconcile (Step 10) with the cert AND the correct
-# trustedCloudSideAppId already applied (edgemachine_impl2.go). So if the
-# extension isn't present yet, skip rather than fail: Step 10 handles it.
-provision_bmagent_patch() {
-  log "[provision] (Step 7) Patch BMAgent trustedCloudSideAppId (best-effort)"
-  local ext; ext="$(az rest --method GET --resource "https://management.azure.com/" \
-    --url "https://management.azure.com${ARC_MACHINE_ID}/extensions?api-version=${EXT_API}" \
-    --query "value[?contains(name, 'BareMetalAgent')] | [0].name" -o tsv 2>/dev/null || true)"
-  if [[ -z "$ext" ]]; then
-    log "[provision]   BMAgent extension not present yet — HCI RP didn't pre-install it (expected on WSL)."
-    log "[provision]   CAPE will install it with the correct settings during Step 10 (DevicePool/CustomLocation). Skipping patch."
-    return 0
-  fi
-  local body; body="$(cat <<JSON
-{ "properties": { "settings": { "BareMetalAgentConfiguration": {
-    "trustedCloudSideAppId": "$C2E_TRUSTED_APP_ID", "trustedTenantId": "$TENANT_ID",
-    "taskExecutionTimeoutInMinutes": 20, "taskExecutionTimeoutWhenUpgradeInMinutes": 5 } } } }
-JSON
-)"
-  az rest --method PATCH --resource "https://management.azure.com/" \
-    --url "https://management.azure.com${ARC_MACHINE_ID}/extensions/${ext}?api-version=${EXT_API}" --body "$body" >/dev/null
-  BMA_EXT_NAME="$ext"
-  log "[provision]   patched BMAgent extension '$ext'"
-}
-
 # Step 8 — RBAC on the edge RG
 provision_rbac() {
   log "[provision] (Step 8) RBAC on edge RG"
@@ -544,43 +515,6 @@ provision_rbac() {
     az role assignment create --assignee-object-id "$oid" --assignee-principal-type ServicePrincipal \
       --role "$role" --scope "$scope" 2>/dev/null || log "[provision]   '$role' already assigned"
   done
-}
-
-# Step 9 — BMAgent hot-swap with the unified build (OPTIONAL, gated by config)
-provision_bmagent_hotswap() {
-  if [[ "${ENABLE_BMAGENT_HOTSWAP:-false}" != "true" ]]; then
-    # For k3s the marketplace BMAgent rejects k3s's /etc/rancher/k3s/config.yaml
-    # ("error 4003: file path rejected"), so the hot-swap is effectively required —
-    # fail fast with a clear message instead of marching into the known failure.
-    if [[ "$DISTRIBUTION" == "k3s" ]]; then
-      die "DISTRIBUTION=k3s requires ENABLE_BMAGENT_HOTSWAP=true (marketplace BMAgent rejects k3s config.yaml, error 4003). Set it in wsl-config.env and re-run."
-    fi
-    log "[provision] (Step 9) BMAgent hot-swap DISABLED (ENABLE_BMAGENT_HOTSWAP=false) — using marketplace BMAgent."
-    log "[provision]   If cluster create fails at node init (NeedNodeInit 404 / file path rejected), set ENABLE_BMAGENT_HOTSWAP=true and re-run."
-    return
-  fi
-  # BMAgent hot-swap applies to BOTH k8s and k3s. For k3s it is effectively
-  # required: the marketplace BMAgent rejects k3s's /etc/rancher/k3s/config.yaml
-  # with "error 4003: file path rejected" — the unified-build binary has the
-  # updated allowlist (see docs/wsl/k3s/wsl-edge-setup.md). Enable via
-  # ENABLE_BMAGENT_HOTSWAP=true (recommended-on for k3s).
-  log "[provision] (Step 9) BMAgent hot-swap (unified build ${BMAGENT_BUILD_DEFINITION})"
-  local adotok base build url
-  adotok="$(az account get-access-token --resource "$ADO_RESOURCE_ID" --query accessToken -o tsv)"
-  base="$ADO_BASE_URL"
-  build="$(curl -sSL -H "Authorization: Bearer $adotok" \
-    "${base}/build/builds?definitions=${BMAGENT_BUILD_DEFINITION}&branchName=refs/heads/main&statusFilter=completed&resultFilter=succeeded&\$top=1&api-version=7.0" \
-    | python3 -c "import json,sys; print(json.load(sys.stdin)['value'][0]['id'])")"
-  [[ -n "$build" ]] || die "no successful BMAgent unified build found"
-  url="$(curl -sSL -H "Authorization: Bearer $adotok" \
-    "${base}/build/builds/${build}/artifacts?artifactName=${BMAGENT_ARTIFACT}&api-version=7.0" \
-    | python3 -c "import json,sys; print(json.load(sys.stdin)['resource']['downloadUrl'])")"
-  sudo curl -sSL -H "Authorization: Bearer $adotok" -o /tmp/bmagent-staged.zip "$url"
-  curl -sSL -H "Authorization: Bearer $adotok" \
-    "${base}/git/repositories/Aks-Arc-Assembly/items?path=${BMAGENT_REPLACE_SCRIPT_PATH}&versionType=branch&version=main&api-version=7.0" \
-    -o /tmp/bmagent-replace-phase2.sh
-  head -1 /tmp/bmagent-replace-phase2.sh | grep -q '^#!' || die "bmagent-replace-phase2.sh download looks invalid"
-  sudo bash /tmp/bmagent-replace-phase2.sh
 }
 
 # Step 10 — DevicePool (creates the CustomLocation), poll
@@ -613,45 +547,6 @@ JSON
     sleep 10
   done
   die "DevicePool did not reach Succeeded in time (waited 25 min)"
-}
-
-# Step 10b — best-effort BMAgent check. NOTE: on this flow BMAgent is installed
-# by CAPE during the EdgeMachine reconcile that runs at CLUSTER CREATE (Step 13),
-# NOT at DevicePool creation — verified empirically (DevicePool + CustomLocation
-# both Succeeded with no BMAgent extension present). So this is a quick, non-fatal
-# probe: if BMAgent already exists we verify its trust settings; otherwise we log
-# and continue — cluster create will install it with the correct
-# trustedCloudSideAppId (edgemachine_impl2.go sets 89ad… itself).
-provision_wait_bmagent() {
-  log "[provision] (Step 10b) Best-effort BMAgent check (installed by CAPE at cluster create)"
-  local ext state
-  for _ in $(seq 1 6); do
-    ext="$(az rest --method GET --resource "https://management.azure.com/" \
-      --url "https://management.azure.com${ARC_MACHINE_ID}/extensions?api-version=${EXT_API}" \
-      --query "value[?contains(name, 'BareMetalAgent')] | [0].name" -o tsv 2>/dev/null || true)"
-    if [[ -n "$ext" ]]; then
-      state="$(az rest --method GET --resource "https://management.azure.com/" \
-        --url "https://management.azure.com${ARC_MACHINE_ID}/extensions/${ext}?api-version=${EXT_API}" \
-        --query "properties.provisioningState" -o tsv 2>/dev/null || true)"
-      log "[provision]   BMAgent '$ext': ${state:-<none>}"
-      if [[ "$state" == "Succeeded" ]]; then
-        BMA_EXT_NAME="$ext"
-        local body; body="$(cat <<JSON
-{ "properties": { "settings": { "BareMetalAgentConfiguration": {
-    "trustedCloudSideAppId": "$C2E_TRUSTED_APP_ID", "trustedTenantId": "$TENANT_ID",
-    "taskExecutionTimeoutInMinutes": 20, "taskExecutionTimeoutWhenUpgradeInMinutes": 5 } } } }
-JSON
-)"
-        az rest --method PATCH --resource "https://management.azure.com/" \
-          --url "https://management.azure.com${ARC_MACHINE_ID}/extensions/${ext}?api-version=${EXT_API}" --body "$body" >/dev/null 2>&1 \
-          && log "[provision]   verified/patched BMAgent trustedCloudSideAppId" \
-          || warn "[provision]   BMAgent settings patch failed (CAPE-applied settings likely already correct)"
-        return 0
-      fi
-    fi
-    sleep 10
-  done
-  log "[provision]   BMAgent not present yet — expected; CAPE installs it during cluster create (Step 13). Continuing."
 }
 
 # Step 11 — LogicalNetwork
@@ -729,11 +624,8 @@ run_provision() {
   provision_block_imds
   provision_arc_connect
   provision_edgemachine
-  provision_bmagent_patch
   provision_rbac
-  provision_bmagent_hotswap
   provision_devicepool
-  provision_wait_bmagent
   provision_lnet
   provision_cluster
   provision_verify

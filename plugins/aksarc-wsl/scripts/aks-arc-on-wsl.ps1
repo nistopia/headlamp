@@ -243,53 +243,69 @@ function Ensure-SystemdPid1 {
 }
 
 function Ensure-AzLogin {
-    # Drive `az login` inside the distro (as root, since provision runs as root)
-    # instead of failing the provision prereq check and making the user re-run.
-    # NOTE: `az account show` writes "Please run 'az login'" to stderr when logged
-    # out. With the script-level $ErrorActionPreference = 'Stop', PowerShell turns
-    # that native stderr into a TERMINATING NativeCommandError before we can branch
-    # to the login path -- and a plain 2>&1/2>$null redirect does NOT prevent it on
+    # Drive `az login` inside the distro (as root, since provision/cleanup run as
+    # root) instead of failing later and making the user re-run. Validate the
+    # token with `az account get-access-token` rather than `az account show` —
+    # the latter reads the local cache and succeeds even when the refresh token
+    # has EXPIRED (e.g. the 12h conditional-access sign-in-frequency cap), which
+    # would let a stale session through to fail mid-operation.
+    $sub = ""; $tenant = ""
+    if (Test-Path $ConfigFile) {
+        $cfg = Get-Content -LiteralPath $ConfigFile
+        $sub = Get-EnvValue -Lines $cfg -Key "CMP_SUB"
+        $tenant = Get-EnvValue -Lines $cfg -Key "TENANT_ID"
+    }
+    # Validate against CMP_SUB (the subscription cleanup/provision actually use),
+    # not just the account default — otherwise a valid default-sub token could
+    # mask a missing/expired token for the sub we operate on.
+    # NOTE: `az account get-access-token` writes to stderr when logged out/expired.
+    # With the script-level $ErrorActionPreference = 'Stop', PowerShell turns that
+    # native stderr into a TERMINATING NativeCommandError before we can branch to
+    # the login path -- and a plain 2>&1/2>$null redirect does NOT prevent it on
     # PS 5.1. So we locally set EAP=SilentlyContinue, redirect all streams, and
     # gate on $LASTEXITCODE (also guarded by try/catch for total safety).
-    $loggedIn = $false
+    $tokenArgs = @("account", "get-access-token", "--query", "expiresOn", "-o", "tsv")
+    if ($sub) { $tokenArgs += @("--subscription", $sub) }
+    $tokenValid = $false
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'SilentlyContinue'
     try {
-        wsl.exe -d $Distro -u root -- az account show --only-show-errors *> $null
-        $loggedIn = ($LASTEXITCODE -eq 0)
+        wsl.exe -d $Distro -u root -- az @tokenArgs *> $null
+        $tokenValid = ($LASTEXITCODE -eq 0)
     } catch {
-        $loggedIn = $false
+        $tokenValid = $false
     } finally {
         $ErrorActionPreference = $prevEAP
     }
-
-    if ($loggedIn) {
-        Write-Step "az already logged in (root context)"
+    if ($tokenValid) {
+        Write-Step "az token valid for subscription $(if ($sub) { $sub } else { '(default)' }) (root context)"
     } else {
-        Write-Step "az not logged in -- launching device-code login (root context)"
+        Write-Step "az not logged in / token expired -- launching device-code login (root context)"
         Write-Host "    Open the URL below and enter the code to sign in." -ForegroundColor Yellow
         # `az login --use-device-code` prints the device-code prompt to stderr.
         # Under EAP='Stop' that native stderr would terminate before login can
-        # finish, so run under EAP='Continue' and merge stderr->stdout (2>&1) so
-        # the code stays VISIBLE in the streamed log. Gate success on exit code.
+        # finish, so run under EAP='Continue' and merge stderr->stdout (2>&1).
+        # Stream it directly (no pipe/capture) so the code stays VISIBLE in real
+        # time, then check the native exit code explicitly.
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            wsl.exe -d $Distro -u root -- az login --use-device-code 2>&1 | Write-Host
+            if ($tenant) {
+                wsl.exe -d $Distro -u root -- az login --use-device-code --tenant $tenant 2>&1
+            } else {
+                wsl.exe -d $Distro -u root -- az login --use-device-code 2>&1
+            }
+            if ($LASTEXITCODE -ne 0) { throw "az login failed (exit $LASTEXITCODE)" }
         } finally {
             $ErrorActionPreference = $prevEAP
         }
-        Throw-IfFailed "az login"
     }
-    # Pin the subscription from the config (CMP_SUB) so provision targets the
+    # Pin the subscription from the config (CMP_SUB) so operations target the
     # right sub regardless of the account's default.
-    if (Test-Path $ConfigFile) {
-        $sub = Get-EnvValue -Lines (Get-Content -LiteralPath $ConfigFile) -Key "CMP_SUB"
-        if ($sub) {
-            wsl.exe -d $Distro -u root -- az account set --subscription $sub
-            Throw-IfFailed "az account set --subscription $sub"
-            Write-Step "az subscription set to $sub"
-        }
+    if ($sub) {
+        wsl.exe -d $Distro -u root -- az account set --subscription $sub
+        Throw-IfFailed "az account set --subscription $sub"
+        Write-Step "az subscription set to $sub"
     }
 }
 
@@ -330,6 +346,7 @@ function Do-Up {
 function Do-Down {
     if (-not (Test-DistroExists)) { throw "Distro '$Distro' does not exist -- nothing to bring down. Available: $((Get-Distros) -join ', ')." }
     Copy-IntoWsl -IncludeCleanup
+    Ensure-AzLogin   # cleanup makes ARM calls; re-auth if the token expired (12h CA cap)
     $scope = if ([string]::IsNullOrEmpty($Target)) { "all" } else { $Target }
     $cargs = @("--config", "~/.aksarc-wsl/wsl-config.env")
     switch ($scope) {
@@ -406,9 +423,9 @@ function Do-Configure {
     $lines = [System.Collections.ArrayList]@(Get-Content -LiteralPath $ConfigFile)
 
     # key, prompt text, allowed-values (or $null), advanced-only.
-    # Constants (API versions, HCI roles, C2E appId, ADO/BMAgent paths, DNS,
-    # VM_SWITCH, BMAGENT_BUILD_DEFINITION) have script defaults and aren't prompted;
-    # AZURE_VM_HOST is auto-detected/injected at stage time.
+    # Constants (API versions, HCI roles, C2E appId, DNS, VM_SWITCH) have script
+    # defaults and aren't prompted; AZURE_VM_HOST is auto-detected/injected at
+    # stage time.
     $fields = @(
         @{ Key = "DISTRIBUTION";           Prompt = "Kubernetes distribution";                 Set = @("k8s", "k3s") },
         @{ Key = "CMP_SUB";                Prompt = "CMP subscription ID";                     Set = $null },
@@ -420,8 +437,7 @@ function Do-Configure {
         @{ Key = "TENANT_ID";              Prompt = "Tenant ID";                               Set = $null },
         @{ Key = "K8S_VERSION";            Prompt = "Kubernetes version (<semver>-<date>)";    Set = $null },
         @{ Key = "AKSARC_WHEEL_PATH";      Prompt = "Private aksarc wheel path (blank=skip)";  Set = $null },
-        @{ Key = "ENABLE_GPU";             Prompt = "Enable GPU + Foundry Local";              Set = @("true", "false") },
-        @{ Key = "ENABLE_BMAGENT_HOTSWAP"; Prompt = "Force BMAgent hot-swap up front";         Set = @("true", "false") }
+        @{ Key = "ENABLE_GPU";             Prompt = "Enable GPU + Foundry Local";              Set = @("true", "false") }
     )
 
     Write-Step "Configuring $ConfigFile  (Enter = keep current value)"
