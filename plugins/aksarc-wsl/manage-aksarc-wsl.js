@@ -40,6 +40,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// The dedicated WSL distro the orchestrator creates/uses (aks-arc-on-wsl.ps1
+// -Distro default). The kubeconfig lives in this distro.
+const DISTRO = 'aks-edge';
+
 // wsl-config.env keys we know how to serialize. Anything else in the payload
 // is ignored so the UI can never inject arbitrary lines into the env file.
 const KNOWN_KEYS = [
@@ -144,7 +148,32 @@ function main() {
   const payload = process.argv[3];
 
   if (!action || !payload) {
-    fail('usage: manage-aksarc-wsl.js <up|down|status> <base64-config>');
+    fail('usage: manage-aksarc-wsl.js <up|down|status|kubeconfig> <base64-config>');
+  }
+
+  if (process.platform !== 'win32') {
+    fail(
+      'AKS Arc on WSL is only supported on Windows (needs wsl.exe + PowerShell). ' +
+        `Detected platform: ${process.platform}.`
+    );
+  }
+
+  // `kubeconfig` streams the cluster's admin.conf out of the WSL distro so the
+  // UI can register it with Headlamp. It does not touch the orchestrator.
+  if (action === 'kubeconfig') {
+    const kc = spawn(
+      'wsl.exe',
+      ['-d', DISTRO, '-u', 'root', '--', 'cat', '/etc/kubernetes/admin.conf'],
+      { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+    kc.stdout.on('data', d => process.stdout.write(d));
+    kc.stderr.on('data', d => process.stderr.write(d));
+    kc.on('error', err => {
+      process.stderr.write(`ERROR: failed to read kubeconfig: ${err.message}\n`);
+      process.exit(1);
+    });
+    kc.on('exit', code => process.exit(code === null ? 1 : code));
+    return;
   }
 
   // Map the plugin action to the orchestrator verb + target.
@@ -159,14 +188,7 @@ function main() {
   };
   const verbArgs = verbMap[action];
   if (!verbArgs) {
-    fail(`unknown action '${action}' (expected up | down | status)`);
-  }
-
-  if (process.platform !== 'win32') {
-    fail(
-      'AKS Arc on WSL is only supported on Windows (needs wsl.exe + PowerShell). ' +
-        `Detected platform: ${process.platform}.`
-    );
+    fail(`unknown action '${action}' (expected up | down | status | kubeconfig)`);
   }
 
   const config = parseConfig(payload);

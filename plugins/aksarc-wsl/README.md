@@ -16,22 +16,39 @@ reimplementing the WSL/`az` bring-up logic.
 
 ## How it works
 
+The plugin registers an **Add Cluster provider card** ("AKS Arc BareMetal
+(connected) — WSL") via `registerAddClusterProvider`, so it appears under
+**Home → Add Cluster → Providers** (next to "Load from KubeConfig"). Clicking it
+opens the create form at `/aksarc-wsl`.
+
 ```
 Headlamp UI (src/index.tsx)
   -> pluginRunCommand('scriptjs', ['aksarc-wsl/manage-aksarc-wsl.js', <action>, <b64 config>])
       -> Electron run-command IPC (permission secret + user consent)
           -> manage-aksarc-wsl.js  (runs on the app/Electron node runtime)
               -> writes a temp wsl-config.env
-              -> powershell.exe -File scripts/aks-arc-on-wsl.ps1 up create -ConfigFile <tmp>
+              -> powershell.exe -File scripts/aks-arc-on-wsl.ps1 up -ConfigFile <tmp>
                   -> setup-aks-arc-wsl.sh inside WSL  -> az aksarc create
 ```
 
-- **Actions:** `Create cluster` (`up create`), `Delete cluster`
-  (`down cluster`), `Status` (`status`).
+- **Actions:** `Create cluster` (full idempotent `up` = prepare + create),
+  `Delete cluster` (`down cluster`), `Status` (`status`).
+- **Auto-load:** after a successful create, the plugin reads the cluster's
+  `admin.conf` from the WSL distro (`kubeconfig` action → `wsl -d aks-edge -u root
+  -- cat /etc/kubernetes/admin.conf`) and registers it with Headlamp via
+  `Headlamp.setCluster({ kubeconfig })` (base64), so the new cluster shows up on
+  the Home page and its details are immediately browsable — no manual
+  "Load from KubeConfig" step.
 - Form values map 1:1 to `wsl-config.env` keys. They are validated and
   serialized into a temporary, `0600`-mode env file for the run; the file is
   removed afterwards.
 - All PowerShell/WSL output streams live back into the UI log panel.
+
+> The apiserver in `admin.conf` is the WSL eth0 IP (e.g. `172.x:6443`), reachable
+> from the Windows host via the WSL vEthernet. Set `vmIdleTimeout=-1` in
+> `%USERPROFILE%\.wslconfig` so the VM (and apiserver) stays up — otherwise WSL
+> idles the VM down and the cluster shows "connection refused". See the AKS Arc on
+> WSL `KNOWN-ISSUES.md` §6.
 
 ## Security model
 
@@ -124,8 +141,9 @@ npm run build
 robocopy dist "$env:APPDATA\Headlamp\Config\plugins\aksarc-wsl" /E
 ```
 
-Restart the app (or, in `make run-app` watch mode, reload). Open **AKS Arc on WSL**
-on the Home sidebar. The first Create/Delete run shows a one-time consent dialog.
+Restart the app (or, in `make run-app` watch mode, reload). Open **Home → Add
+Cluster → Providers → AKS Arc BareMetal (connected) — WSL**. The first
+Create/Delete run shows a one-time consent dialog.
 
 ## Bundled aksarc CLI wheel
 

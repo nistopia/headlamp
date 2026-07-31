@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import { registerRoute, registerSidebarEntry } from '@kinvolk/headlamp-plugin/lib';
+import { Headlamp, registerAddClusterProvider, registerRoute } from '@kinvolk/headlamp-plugin/lib';
 import { SectionBox } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
 import {
   Alert,
@@ -32,7 +32,7 @@ import {
   TextField,
   Typography,
 } from '@mui/material';
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 /**
  * `pluginRunCommand` is injected into this plugin's execution scope by the
@@ -143,6 +143,44 @@ function CreateAksArcOnWsl() {
 
   const append = (chunk: string) => setLog(prev => prev + chunk);
 
+  /**
+   * After a successful create, read the cluster's admin.conf out of the WSL
+   * distro and register it with Headlamp (Headlamp.setCluster expects a
+   * base64-encoded kubeconfig) so the new cluster shows up on the Home page and
+   * its details are browsable — no manual "Load from KubeConfig" step.
+   */
+  const autoLoadCluster = () => {
+    if (!pluginRunCommand) {
+      return;
+    }
+    append('\n>>> Registering the cluster in Headlamp (reading kubeconfig)...\n');
+    let kubeconfig = '';
+    const proc = pluginRunCommand('scriptjs', [SCRIPT, 'kubeconfig', encodePayload(config)], {});
+    proc.stdout.on('data', (d: string) => {
+      kubeconfig += d;
+    });
+    proc.stderr.on('data', (d: string) => append(d));
+    proc.on('exit', (code: number | null) => {
+      if (code !== 0 || !kubeconfig.includes('apiVersion')) {
+        append(
+          '>>> Could not read the kubeconfig automatically. Use "Load from KubeConfig" ' +
+            'with /etc/kubernetes/admin.conf from the aks-edge distro.\n'
+        );
+        return;
+      }
+      try {
+        const b64 = btoa(unescape(encodeURIComponent(kubeconfig.trim())));
+        Promise.resolve(Headlamp.setCluster({ kubeconfig: b64 }))
+          .then(() => append('>>> Cluster registered. Open it from the Home page.\n'))
+          .catch((e: any) =>
+            append(`>>> Failed to register cluster in Headlamp: ${e?.message ?? e}\n`)
+          );
+      } catch (e: any) {
+        append(`>>> Failed to encode kubeconfig: ${e?.message ?? e}\n`);
+      }
+    });
+  };
+
   const run = (action: 'up' | 'down' | 'status') => {
     if (!pluginRunCommand) {
       append('ERROR: This action only works in the Headlamp desktop app.\n');
@@ -164,6 +202,9 @@ function CreateAksArcOnWsl() {
       setExitCode(code);
       setRunning(false);
       append(`\n>>> Process exited with code ${code}\n`);
+      if (action === 'up' && code === 0) {
+        autoLoadCluster();
+      }
     });
   };
 
@@ -300,24 +341,31 @@ function CreateAksArcOnWsl() {
   );
 }
 
-registerSidebarEntry({
-  parent: null,
-  name: 'aksarc-wsl',
-  label: 'AKS Arc on WSL',
-  url: '/aksarc-wsl',
-  icon: 'mdi:kubernetes',
-  sidebar: 'HOME',
-});
+/** Simple inline SVG icon for the Add Cluster provider card. */
+function AksArcWslIcon(props: React.SVGAttributes<SVGElement>) {
+  return (
+    <svg viewBox="0 0 24 24" width="1em" height="1em" fill="currentColor" {...props}>
+      <path d="M12 2 3 6.5v11L12 22l9-4.5v-11L12 2Zm0 2.3 6 3-6 3-6-3 6-3ZM5 8.6l6 3v7l-6-3v-7Zm14 0v7l-6 3v-7l6-3Z" />
+    </svg>
+  );
+}
 
 registerRoute({
   path: '/aksarc-wsl',
-  sidebar: {
-    item: 'aksarc-wsl',
-    sidebar: 'HOME',
-  },
+  sidebar: null,
   useClusterURL: false,
   noAuthRequired: true,
   name: 'aksarc-wsl',
   exact: true,
   component: () => <CreateAksArcOnWsl />,
+});
+
+registerAddClusterProvider({
+  title: 'AKS Arc BareMetal (connected) — WSL',
+  icon: AksArcWslIcon,
+  description:
+    'Provision an AKS Arc (SFF/BareMetal, Azure Arc-connected) edge cluster using ' +
+    'WSL2 as the edge node. Drives the hardened aks-arc-on-wsl.ps1 orchestrator on ' +
+    'this machine, then registers the new cluster in Headlamp. Windows desktop app only.',
+  url: '/aksarc-wsl',
 });
