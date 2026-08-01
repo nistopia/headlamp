@@ -21,6 +21,7 @@ import {
   Box,
   Button,
   Grid,
+  MenuItem,
   Paper,
   Stack,
   TextField,
@@ -61,6 +62,7 @@ interface AksArcWslConfig {
   CMP_RESOURCE_GROUP: string;
   CMP_NAME: string;
   AKSARC_WHEEL_PATH: string;
+  AKSARC_BUILD_ID: string;
   AUTH_MODE: string;
 }
 
@@ -74,6 +76,7 @@ const DEFAULT_CONFIG: AksArcWslConfig = {
   CMP_RESOURCE_GROUP: '',
   CMP_NAME: '',
   AKSARC_WHEEL_PATH: '',
+  AKSARC_BUILD_ID: '174744438',
   AUTH_MODE: 'browser',
 };
 
@@ -124,7 +127,11 @@ function CreateAksArcOnWsl() {
     });
   };
 
-  const missing = REQUIRED_FIELDS.filter(f => !String(config[f]).trim());
+  const isK3s = String(config.DISTRIBUTION).trim().toLowerCase() === 'k3s';
+  const requiredFields: (keyof AksArcWslConfig)[] = isK3s
+    ? [...REQUIRED_FIELDS, 'AKSARC_BUILD_ID', 'CMP_SUBSCRIPTION', 'CMP_RESOURCE_GROUP', 'CMP_NAME']
+    : REQUIRED_FIELDS;
+  const missing = requiredFields.filter(f => !String(config[f]).trim());
 
   const append = (chunk: string) => setLog(prev => prev + chunk);
 
@@ -208,34 +215,24 @@ function CreateAksArcOnWsl() {
     },
     { key: 'TENANT_ID', label: 'Tenant ID', required: true },
     { key: 'LOCATION', label: 'Region', helper: 'Public preview: eastus only.' },
+  ];
+
+  // Shown only when Distribution = k3s. k3s needs the pipeline-built wheel (the public
+  // wheel has no --distribution/--cmp-* flags yet) and routing to a private CMP. The
+  // wheel is pulled automatically from the given ADO build's drop_Build_main artifact.
+  const k3sFields: typeof fields = [
     {
-      key: 'AUTH_MODE',
-      label: 'Sign-in mode (browser, sp, or device-code)',
-      helper: 'browser (default) opens the Windows browser and avoids device-code (which Conditional Access can block). sp = service principal (set AZURE_CLIENT_ID/SECRET in the config).',
+      key: 'AKSARC_BUILD_ID',
+      label: 'aksarc CLI build id',
+      required: true,
+      helper: 'ADO build whose wheel (with k3s/--cmp-* support) is installed automatically, e.g. 174744438.',
     },
-    {
-      key: 'DISTRIBUTION',
-      label: 'Distribution (k8s or k3s)',
-      helper: 'k3s requires a private CMP (fill the CMP fields below) and the pipeline-built wheel.',
-    },
-    {
-      key: 'AKSARC_WHEEL_PATH',
-      label: 'aksarc wheel path (optional)',
-      helper: 'Local .whl to install instead of the public wheel, e.g. /mnt/c/Users/you/aksarc-2.0.0b1.devN-py3-none-any.whl. Required for k3s/--cmp-* support.',
-    },
-    {
-      key: 'CMP_SUBSCRIPTION',
-      label: 'CMP subscription (k3s)',
-      helper: 'Private CMP subscription id.',
-    },
-    {
-      key: 'CMP_RESOURCE_GROUP',
-      label: 'CMP resource group (k3s)',
-      helper: 'Private CMP resource group.',
-    },
+    { key: 'CMP_SUBSCRIPTION', label: 'CMP subscription', required: true, helper: 'Private CMP subscription id.' },
+    { key: 'CMP_RESOURCE_GROUP', label: 'CMP resource group', required: true, helper: 'Private CMP resource group.' },
     {
       key: 'CMP_NAME',
-      label: 'CMP name (k3s)',
+      label: 'CMP name',
+      required: true,
       helper: 'Private CMP cluster name (the AKS managed cluster and its Arc-connected cluster share this name).',
     },
   ];
@@ -273,6 +270,43 @@ function CreateAksArcOnWsl() {
               />
             </Grid>
           ))}
+
+          <Grid item xs={12} sm={6}>
+            <TextField
+              select
+              fullWidth
+              size="small"
+              label="Distribution"
+              helperText={
+                isK3s
+                  ? 'Routes to a private CMP; installs the CLI wheel from the build below.'
+                  : 'Public managed-CMP flow (no extra fields needed).'
+              }
+              value={config.DISTRIBUTION}
+              onChange={e => setField('DISTRIBUTION', e.target.value)}
+              disabled={running}
+            >
+              <MenuItem value="k8s">k8s (public managed CMP)</MenuItem>
+              <MenuItem value="k3s">k3s (private CMP)</MenuItem>
+            </TextField>
+          </Grid>
+
+          {isK3s &&
+            k3sFields.map(f => (
+              <Grid item xs={12} sm={6} key={f.key}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  label={f.label}
+                  required={f.required}
+                  helperText={f.helper}
+                  value={String(config[f.key])}
+                  onChange={e => setField(f.key, e.target.value)}
+                  error={!!f.required && !String(config[f.key]).trim()}
+                  disabled={running}
+                />
+              </Grid>
+            ))}
         </Grid>
 
         <Stack direction="row" spacing={2} sx={{ mt: 2 }}>
