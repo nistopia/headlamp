@@ -93,7 +93,7 @@ function serializeEnv(config) {
     if (typeof value === 'boolean') {
       value = value ? 'true' : 'false';
     }
-    value = String(value);
+    value = String(value).trim();
     if (FORBIDDEN_RE.test(value)) {
       fail(`value for ${key} must be a single line`);
     }
