@@ -193,13 +193,29 @@ verify_systemd() {
   sudo nsenter -t 1 -m -- mount --make-rshared / 2>/dev/null || true
 }
 
+tokens_ok() {
+  # Returns 0 only if the tokens the deploy actually needs can be acquired — which
+  # exercises the refresh token. A cached-but-stale access token with a dead refresh
+  # token (AADSTS70008) returns non-zero, so ensure_login forces a fresh interactive
+  # sign-in instead of failing mid-deploy.
+  az account set --subscription "$SUBSCRIPTION" >/dev/null 2>&1 || return 1
+  az account get-access-token --resource https://management.azure.com/ -o none 2>/dev/null || return 1
+  if [[ -n "$AKSARC_BUILD_ID" ]]; then
+    # Azure DevOps resource — needed by 'az pipelines runs artifact download'.
+    az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 -o none 2>/dev/null || return 1
+  fi
+  return 0
+}
+
 ensure_login() {
   log "[deploy] Ensuring az login (subscription $SUBSCRIPTION, auth=$AUTH_MODE)"
-  if az account get-access-token --subscription "$SUBSCRIPTION" --query expiresOn -o tsv >/dev/null 2>&1; then
-    az account set --subscription "$SUBSCRIPTION"
+  if tokens_ok; then
     log "[deploy]   already logged in; subscription set to $SUBSCRIPTION"
     return
   fi
+  # Clear any stale/expired cached credentials (avoids AADSTS70008 from a dead refresh
+  # token in the reused distro) so the fresh login starts clean.
+  az logout >/dev/null 2>&1 || true
   case "$AUTH_MODE" in
     browser)
       # Interactive browser login (NOT device-code): az starts a localhost redirect and
