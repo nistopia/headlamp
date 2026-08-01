@@ -76,7 +76,7 @@ const DEFAULT_CONFIG: AksArcWslConfig = {
   CMP_RESOURCE_GROUP: '',
   CMP_NAME: '',
   AKSARC_WHEEL_PATH: '',
-  AKSARC_BUILD_ID: '174744438',
+  AKSARC_BUILD_ID: '174772467',
   AUTH_MODE: 'browser',
 };
 
