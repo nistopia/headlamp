@@ -24,6 +24,9 @@
 #   CMP_SUBSCRIPTION   Private CMP subscription id                   (k3s/private-CMP)
 #   CMP_RESOURCE_GROUP Private CMP resource group                    (k3s/private-CMP)
 #   CMP_NAME           Private CMP cluster name (AKS + connected)    (k3s/private-CMP)
+#   AUTH_MODE          browser (default) | sp | device-code          (how az/azcmagent sign in)
+#   AZURE_CLIENT_ID    Service-principal appId                       (AUTH_MODE=sp)
+#   AZURE_CLIENT_SECRET Service-principal secret                     (AUTH_MODE=sp)
 #   VALIDATE_ONLY      "true" => `az aksarc deploy --validate` dry-run only
 # -----------------------------------------------------------------------------
 set -euo pipefail
@@ -66,6 +69,13 @@ DISTRIBUTION="${DISTRIBUTION:-k8s}"
 CMP_SUBSCRIPTION="${CMP_SUBSCRIPTION:-}"
 CMP_RESOURCE_GROUP="${CMP_RESOURCE_GROUP:-}"
 CMP_NAME="${CMP_NAME:-}"
+# Sign-in method. Default 'browser' avoids device-code: az opens the Windows browser
+# via wslview so auth happens on the (Conditional-Access-compliant) Windows device,
+# and azcmagent reuses that token. 'sp' is fully non-interactive. 'device-code' is the
+# old behavior (blocked by CA that requires a compliant device).
+AUTH_MODE="${AUTH_MODE:-browser}"
+AZURE_CLIENT_ID="${AZURE_CLIENT_ID:-}"
+AZURE_CLIENT_SECRET="${AZURE_CLIENT_SECRET:-}"
 ASYNCSSH_SAFE_VERSION="2.17.0"
 
 # Well-known appId of the Microsoft.AzureStackHCI resource provider (same in
@@ -184,11 +194,35 @@ verify_systemd() {
 }
 
 ensure_login() {
-  log "[deploy] Ensuring az login (subscription $SUBSCRIPTION)"
-  if ! az account get-access-token --subscription "$SUBSCRIPTION" --query expiresOn -o tsv >/dev/null 2>&1; then
-    log "[deploy]   not logged in / token expired — launching device-code login"
-    az login --use-device-code --tenant "$TENANT_ID"
+  log "[deploy] Ensuring az login (subscription $SUBSCRIPTION, auth=$AUTH_MODE)"
+  if az account get-access-token --subscription "$SUBSCRIPTION" --query expiresOn -o tsv >/dev/null 2>&1; then
+    az account set --subscription "$SUBSCRIPTION"
+    log "[deploy]   already logged in; subscription set to $SUBSCRIPTION"
+    return
   fi
+  case "$AUTH_MODE" in
+    browser)
+      # Interactive browser login (NOT device-code): az starts a localhost redirect and
+      # opens the Windows default browser via wslview. Auth completes on the compliant
+      # Windows device, satisfying Conditional Access; the redirect returns to WSL localhost.
+      if ! command -v wslview >/dev/null 2>&1; then
+        log "[deploy]   installing wslu (provides wslview) for browser login"
+        sudo apt-get update -qq && sudo apt-get install -y -qq wslu
+      fi
+      BROWSER="$(command -v wslview)" az login --tenant "$TENANT_ID" --only-show-errors
+      ;;
+    sp)
+      [[ -n "$AZURE_CLIENT_ID" && -n "$AZURE_CLIENT_SECRET" ]] \
+        || die "AUTH_MODE=sp requires AZURE_CLIENT_ID and AZURE_CLIENT_SECRET"
+      az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" \
+        --tenant "$TENANT_ID" --only-show-errors
+      ;;
+    device-code)
+      warn "AUTH_MODE=device-code may be blocked by Conditional Access (AADSTS53003)"
+      az login --use-device-code --tenant "$TENANT_ID"
+      ;;
+    *) die "AUTH_MODE must be one of: browser | sp | device-code" ;;
+  esac
   az account set --subscription "$SUBSCRIPTION"
   log "[deploy]   subscription set to $SUBSCRIPTION"
 }
@@ -266,13 +300,24 @@ arc_connect() {
     curl -sSL -o /tmp/install_azcmagent.sh https://gbl.his.arc.azure.com/azcmagent-linux
     sudo bash /tmp/install_azcmagent.sh
   fi
+  # Sign in azcmagent without its own device-code prompt: reuse the az session by
+  # passing an ARM access token (browser/device-code modes), or SP creds (sp mode).
+  local -a arc_auth
+  if [[ "$AUTH_MODE" == "sp" ]]; then
+    arc_auth=(--service-principal-id "$AZURE_CLIENT_ID" --service-principal-secret "$AZURE_CLIENT_SECRET")
+  else
+    local tok
+    tok="$(az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv)"
+    [[ -n "$tok" ]] || die "could not obtain an ARM access token for azcmagent connect"
+    arc_auth=(--access-token "$tok")
+  fi
   sudo azcmagent connect \
     --subscription-id "$SUBSCRIPTION" \
     --resource-group  "$RESOURCE_GROUP" \
     --tenant-id       "$TENANT_ID" \
     --location        "$LOCATION" \
     --cloud           "AzureCloud" \
-    --use-device-code
+    "${arc_auth[@]}"
   azcmagent show | grep -q 'Agent Status *: *Connected' || die "azcmagent connect did not reach Connected"
 }
 

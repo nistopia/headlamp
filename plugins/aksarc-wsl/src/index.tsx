@@ -61,6 +61,7 @@ interface AksArcWslConfig {
   CMP_RESOURCE_GROUP: string;
   CMP_NAME: string;
   AKSARC_WHEEL_PATH: string;
+  AUTH_MODE: string;
 }
 
 const DEFAULT_CONFIG: AksArcWslConfig = {
@@ -73,6 +74,7 @@ const DEFAULT_CONFIG: AksArcWslConfig = {
   CMP_RESOURCE_GROUP: '',
   CMP_NAME: '',
   AKSARC_WHEEL_PATH: '',
+  AUTH_MODE: 'browser',
 };
 
 const STORAGE_KEY = 'aksarc-wsl-deploy-config';
@@ -206,6 +208,11 @@ function CreateAksArcOnWsl() {
     },
     { key: 'TENANT_ID', label: 'Tenant ID', required: true },
     { key: 'LOCATION', label: 'Region', helper: 'Public preview: eastus only.' },
+    {
+      key: 'AUTH_MODE',
+      label: 'Sign-in mode (browser, sp, or device-code)',
+      helper: 'browser (default) opens the Windows browser and avoids device-code (which Conditional Access can block). sp = service principal (set AZURE_CLIENT_ID/SECRET in the config).',
+    },
     {
       key: 'DISTRIBUTION',
       label: 'Distribution (k8s or k3s)',
