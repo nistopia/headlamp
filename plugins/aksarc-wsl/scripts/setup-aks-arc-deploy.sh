@@ -17,7 +17,13 @@
 #   RESOURCE_GROUP     Resource group (MUST be in eastus)           (required)
 #   TENANT_ID          Microsoft Entra tenant ID                    (required)
 #   LOCATION           Region (public preview: eastus only)         (default eastus)
-#   AKSARC_WHEEL_URL   Public aksarc CLI wheel                       (has default)
+#   AKSARC_WHEEL_PATH  Local .whl to install (e.g. a pipeline build) (optional)
+#   AKSARC_BUILD_ID    ADO build id to pull drop_Build_main/dist/*.whl from (optional; needs ADO auth)
+#   AKSARC_WHEEL_URL   Public aksarc CLI wheel                       (fallback default)
+#   DISTRIBUTION       k8s (default) | k3s (k3s requires a private CMP)
+#   CMP_SUBSCRIPTION   Private CMP subscription id                   (k3s/private-CMP)
+#   CMP_RESOURCE_GROUP Private CMP resource group                    (k3s/private-CMP)
+#   CMP_NAME           Private CMP cluster name (AKS + connected)    (k3s/private-CMP)
 #   VALIDATE_ONLY      "true" => `az aksarc deploy --validate` dry-run only
 # -----------------------------------------------------------------------------
 set -euo pipefail
@@ -49,8 +55,17 @@ SUBSCRIPTION="${SUBSCRIPTION:?SUBSCRIPTION must be set in config}"
 RESOURCE_GROUP="${RESOURCE_GROUP:?RESOURCE_GROUP must be set in config}"
 TENANT_ID="${TENANT_ID:?TENANT_ID must be set in config}"
 LOCATION="${LOCATION:-eastus}"
+# aksarc wheel source, in precedence order: local path > ADO build artifact > public URL.
+AKSARC_WHEEL_PATH="${AKSARC_WHEEL_PATH:-}"
+AKSARC_BUILD_ID="${AKSARC_BUILD_ID:-}"
 AKSARC_WHEEL_URL="${AKSARC_WHEEL_URL:-https://hybridaksstorage.z13.web.core.windows.net/HybridAKS/CLI/aksarc-2.0.0b21-py3-none-any.whl}"
 VALIDATE_ONLY="${VALIDATE_ONLY:-false}"
+# Cluster distribution + private-CMP routing. k3s (and any private CMP) requires the
+# pipeline-built wheel that exposes --distribution/--cmp-*; the public wheel does not.
+DISTRIBUTION="${DISTRIBUTION:-k8s}"
+CMP_SUBSCRIPTION="${CMP_SUBSCRIPTION:-}"
+CMP_RESOURCE_GROUP="${CMP_RESOURCE_GROUP:-}"
+CMP_NAME="${CMP_NAME:-}"
 ASYNCSSH_SAFE_VERSION="2.17.0"
 
 # Well-known appId of the Microsoft.AzureStackHCI resource provider (same in
@@ -192,9 +207,28 @@ install_extensions() {
   log "[deploy] Installing az CLI extensions (connectedk8s, connectedmachine, aksarc)"
   az extension add --name connectedk8s --only-show-errors 2>/dev/null || az extension update --name connectedk8s --only-show-errors 2>/dev/null || true
   az extension add --name connectedmachine --only-show-errors 2>/dev/null || az extension update --name connectedmachine --only-show-errors 2>/dev/null || true
-  log "[deploy]   installing aksarc from $AKSARC_WHEEL_URL"
   az extension remove --name aksarc 2>/dev/null || true
-  az extension add --source "$AKSARC_WHEEL_URL" --yes
+
+  # Resolve the wheel source (local path > ADO build artifact > public URL).
+  local whl=""
+  if [[ -n "$AKSARC_WHEEL_PATH" ]]; then
+    [[ -f "$AKSARC_WHEEL_PATH" ]] || die "AKSARC_WHEEL_PATH set but file not found: $AKSARC_WHEEL_PATH"
+    whl="$AKSARC_WHEEL_PATH"
+  elif [[ -n "$AKSARC_BUILD_ID" ]]; then
+    log "[deploy]   downloading aksarc wheel from ADO build $AKSARC_BUILD_ID (drop_Build_main)"
+    local dl="/tmp/aksarc-whl-$AKSARC_BUILD_ID"
+    rm -rf "$dl"; mkdir -p "$dl"
+    az pipelines runs artifact download --org https://dev.azure.com/msazure --project msk8s \
+      --run-id "$AKSARC_BUILD_ID" --artifact-name drop_Build_main --path "$dl" \
+      || die "could not download build $AKSARC_BUILD_ID artifact (need 'az devops login' or AZURE_DEVOPS_EXT_PAT)"
+    whl="$(find "$dl" -name 'aksarc-*.whl' | head -1)"
+    [[ -n "$whl" ]] || die "no aksarc-*.whl found in build $AKSARC_BUILD_ID drop_Build_main"
+  else
+    whl="$AKSARC_WHEEL_URL"
+  fi
+
+  log "[deploy]   installing aksarc from $whl"
+  az extension add --source "$whl" --yes
   fixup_asyncssh
   local ver; ver="$(az extension show --name aksarc --query version -o tsv 2>/dev/null || echo '?')"
   log "[deploy]   aksarc extension version: $ver"
@@ -255,14 +289,25 @@ grant_hcirp_roles() {
 }
 
 deploy_cluster() {
+  local -a args=(-g "$RESOURCE_GROUP" --arc-machine-names "$ARC_MACHINE_NAME" --subscription "$SUBSCRIPTION")
+  # Only pass --distribution/--cmp-* when opting into k3s or a private CMP — these flags
+  # exist only in the pipeline-built wheel, so the default public-CMPS k8s flow stays
+  # compatible with the public wheel.
+  if [[ "$DISTRIBUTION" != "k8s" || -n "$CMP_NAME" ]]; then
+    args+=(--distribution "$DISTRIBUTION")
+    [[ -n "$CMP_SUBSCRIPTION" ]]   && args+=(--cmp-subscription "$CMP_SUBSCRIPTION")
+    [[ -n "$CMP_RESOURCE_GROUP" ]] && args+=(--cmp-resource-group "$CMP_RESOURCE_GROUP")
+    [[ -n "$CMP_NAME" ]]           && args+=(--cmp-name "$CMP_NAME")
+  fi
+
   if [[ "$VALIDATE_ONLY" == "true" ]]; then
-    log "[deploy] Validating (dry-run) az aksarc deploy for machine '$ARC_MACHINE_NAME'"
-    az aksarc deploy -g "$RESOURCE_GROUP" --arc-machine-names "$ARC_MACHINE_NAME" --validate --subscription "$SUBSCRIPTION"
+    log "[deploy] Validating (dry-run) az aksarc deploy for machine '$ARC_MACHINE_NAME' (distribution=$DISTRIBUTION)"
+    az aksarc deploy "${args[@]}" --validate
     log "[deploy] Validation complete (no resources created)."
     return
   fi
-  log "[deploy] Running az aksarc deploy (machine '$ARC_MACHINE_NAME') — this can take ~40 min"
-  az aksarc deploy -g "$RESOURCE_GROUP" --arc-machine-names "$ARC_MACHINE_NAME" --yes --subscription "$SUBSCRIPTION"
+  log "[deploy] Running az aksarc deploy (machine '$ARC_MACHINE_NAME', distribution=$DISTRIBUTION) — this can take ~40 min"
+  az aksarc deploy "${args[@]}" --yes
   log "[deploy] DONE — cluster deploy submitted for '$ARC_MACHINE_NAME'."
 }
 

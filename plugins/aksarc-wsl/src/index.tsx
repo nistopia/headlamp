@@ -56,6 +56,11 @@ interface AksArcWslConfig {
   RESOURCE_GROUP: string;
   TENANT_ID: string;
   LOCATION: string;
+  DISTRIBUTION: string;
+  CMP_SUBSCRIPTION: string;
+  CMP_RESOURCE_GROUP: string;
+  CMP_NAME: string;
+  AKSARC_WHEEL_PATH: string;
 }
 
 const DEFAULT_CONFIG: AksArcWslConfig = {
@@ -63,6 +68,11 @@ const DEFAULT_CONFIG: AksArcWslConfig = {
   RESOURCE_GROUP: '',
   TENANT_ID: '',
   LOCATION: 'eastus',
+  DISTRIBUTION: 'k8s',
+  CMP_SUBSCRIPTION: '',
+  CMP_RESOURCE_GROUP: '',
+  CMP_NAME: '',
+  AKSARC_WHEEL_PATH: '',
 };
 
 const STORAGE_KEY = 'aksarc-wsl-deploy-config';
@@ -196,6 +206,31 @@ function CreateAksArcOnWsl() {
     },
     { key: 'TENANT_ID', label: 'Tenant ID', required: true },
     { key: 'LOCATION', label: 'Region', helper: 'Public preview: eastus only.' },
+    {
+      key: 'DISTRIBUTION',
+      label: 'Distribution (k8s or k3s)',
+      helper: 'k3s requires a private CMP (fill the CMP fields below) and the pipeline-built wheel.',
+    },
+    {
+      key: 'AKSARC_WHEEL_PATH',
+      label: 'aksarc wheel path (optional)',
+      helper: 'Local .whl to install instead of the public wheel, e.g. /mnt/c/Users/you/aksarc-2.0.0b1.devN-py3-none-any.whl. Required for k3s/--cmp-* support.',
+    },
+    {
+      key: 'CMP_SUBSCRIPTION',
+      label: 'CMP subscription (k3s)',
+      helper: 'Private CMP subscription id.',
+    },
+    {
+      key: 'CMP_RESOURCE_GROUP',
+      label: 'CMP resource group (k3s)',
+      helper: 'Private CMP resource group.',
+    },
+    {
+      key: 'CMP_NAME',
+      label: 'CMP name (k3s)',
+      helper: 'Private CMP cluster name (the AKS managed cluster and its Arc-connected cluster share this name).',
+    },
   ];
 
   return (
