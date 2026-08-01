@@ -307,26 +307,40 @@ ensure_rg() {
 
 arc_connect() {
   log "[deploy] Arc-enabling the host ($ARC_MACHINE_NAME)"
-  if azcmagent show 2>/dev/null | grep -q 'Agent Status *: *Connected'; then
-    log "[deploy]   azcmagent already Connected"
-    return
-  fi
   if ! command -v azcmagent >/dev/null 2>&1; then
     log "[deploy]   installing azcmagent"
     curl -sSL -o /tmp/install_azcmagent.sh https://gbl.his.arc.azure.com/azcmagent-linux
     sudo bash /tmp/install_azcmagent.sh
   fi
-  # Sign in azcmagent without its own device-code prompt: reuse the az session by
-  # passing an ARM access token (browser/device-code modes), or SP creds (sp mode).
+
+  # azcmagent auth (token or SP) — needed for both connect and any disconnect.
   local -a arc_auth
   if [[ "$AUTH_MODE" == "sp" ]]; then
     arc_auth=(--service-principal-id "$AZURE_CLIENT_ID" --service-principal-secret "$AZURE_CLIENT_SECRET")
   else
     local tok
     tok="$(az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv)"
-    [[ -n "$tok" ]] || die "could not obtain an ARM access token for azcmagent connect"
+    [[ -n "$tok" ]] || die "could not obtain an ARM access token for azcmagent"
     arc_auth=(--access-token "$tok")
   fi
+
+  # If already Connected, make sure it is to THIS subscription+RG. A host left
+  # connected to a different/old RG makes the deploy fail with ParentResourceNotFound,
+  # because Microsoft.HybridCompute/machines/<host> won't exist in the deploy RG.
+  if azcmagent show 2>/dev/null | grep -q 'Agent Status *: *Connected'; then
+    local cur_rg cur_sub
+    cur_rg="$(azcmagent show 2>/dev/null | grep -i 'resource group' | head -1 | sed 's/^[^:]*: *//' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+    cur_sub="$(azcmagent show 2>/dev/null | grep -i 'subscription id' | head -1 | sed 's/^[^:]*: *//' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+    if [[ "$cur_rg" == "$RESOURCE_GROUP" && "$cur_sub" == "$SUBSCRIPTION" ]]; then
+      log "[deploy]   azcmagent already Connected to $SUBSCRIPTION/$RESOURCE_GROUP"
+      return
+    fi
+    warn "  azcmagent Connected to ${cur_sub:-?}/${cur_rg:-?}, not $SUBSCRIPTION/$RESOURCE_GROUP — reconnecting"
+    sudo azcmagent disconnect "${arc_auth[@]}" 2>/dev/null \
+      || sudo azcmagent disconnect --force-local-only 2>/dev/null \
+      || warn "  disconnect returned non-zero; continuing to connect"
+  fi
+
   sudo azcmagent connect \
     --subscription-id "$SUBSCRIPTION" \
     --resource-group  "$RESOURCE_GROUP" \
