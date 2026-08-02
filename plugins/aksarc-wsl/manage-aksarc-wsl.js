@@ -32,6 +32,8 @@
 
 const { spawn } = require('child_process');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 
 // Dedicated WSL distro + base image for the edge node.
 const DISTRO = 'aks-edge';
@@ -170,6 +172,44 @@ async function ensureDistro() {
   }
 }
 
+/**
+ * Keep the WSL2 utility VM alive for the whole (~40 min) deploy. Without this,
+ * WSL idles the VM down after ~60s of no in-distro activity, which stops the Arc
+ * agent — and the deploy's on-host AksArcPrereqs extension then wedges in
+ * "Creating" because there is no agent to run it. vmIdleTimeout is a VM-level
+ * (.wslconfig [wsl2]) setting, so applying a change needs a `wsl --shutdown`.
+ */
+async function ensureWslKeepAlive() {
+  const cfgPath = path.join(os.homedir(), '.wslconfig');
+  let orig = '';
+  try {
+    orig = fs.readFileSync(cfgPath, 'utf8');
+  } catch (e) {
+    orig = '';
+  }
+  let next;
+  if (/^\s*vmIdleTimeout\s*=/m.test(orig)) {
+    next = orig.replace(/^\s*vmIdleTimeout\s*=.*$/m, 'vmIdleTimeout=-1');
+  } else if (/^\s*\[wsl2\]/m.test(orig)) {
+    next = orig.replace(/^(\s*\[wsl2\][^\n]*\n)/m, '$1vmIdleTimeout=-1\n');
+  } else {
+    next = (orig.trim() ? orig.replace(/\s*$/, '') + '\n\n' : '') + '[wsl2]\nvmIdleTimeout=-1\n';
+  }
+  if (next === orig) {
+    return; // already keeping the VM alive
+  }
+  try {
+    fs.writeFileSync(cfgPath, next);
+  } catch (e) {
+    log(`>>> WARN: could not write ${cfgPath} (${e.message}); the WSL VM may idle down mid-deploy`);
+    return;
+  }
+  log('>>> Set vmIdleTimeout=-1 in .wslconfig (keeps the WSL VM alive during the deploy)');
+  // Apply the VM-level setting. This restarts the WSL2 utility VM; the next wsl
+  // command re-boots the distro with the new timeout in effect.
+  await wsl('--shutdown');
+}
+
 /** Copy the bundled deploy script + write the config into the distro. */
 async function stage(config) {
   const scriptWin = path.join(__dirname, 'scripts', 'setup-aks-arc-deploy.sh');
@@ -197,6 +237,7 @@ const runPhase = phase =>
   wslRoot(`cd ${STAGE} && ./setup-aks-arc-deploy.sh --phase ${phase} --config ${STAGE}/deploy-config.env`);
 
 async function actionUp(config) {
+  await ensureWslKeepAlive();
   await ensureDistro();
   await stage(config);
 
