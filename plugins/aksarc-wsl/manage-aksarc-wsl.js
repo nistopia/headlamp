@@ -157,6 +157,39 @@ async function systemdIsPid1() {
   return code === 0 && out.trim() === 'systemd';
 }
 
+async function importDistro() {
+  // Fallback when `wsl --install --name` fails — e.g. its WinINET-based downloader
+  // can't reach raw.githubusercontent.com on some (corp) networks even though the
+  // rest of the internet is fine. Download the Ubuntu 24.04 WSL image directly with
+  // curl.exe (a working network path) and import it as a FRESH, SEPARATE distro:
+  // no dependency on WSL's built-in downloader, and no clone of any existing distro.
+  // Detect target arch by probing the base distro's kernel — process.arch is
+  // unreliable under x64 emulation on ARM64 Windows.
+  let arm64 = false;
+  const probe = await capture('wsl.exe', ['-d', BASE_DISTRO, '--', 'uname', '-m']);
+  if (probe.code === 0) {
+    arm64 = probe.out.trim() === 'aarch64';
+  } else {
+    arm64 = process.env.PROCESSOR_ARCHITECTURE === 'ARM64' || process.env.PROCESSOR_ARCHITEW6432 === 'ARM64';
+  }
+  const url = arm64
+    ? 'https://cdimages.ubuntu.com/releases/24.04.4/release/ubuntu-24.04.4-wsl-arm64.wsl'
+    : 'https://releases.ubuntu.com/24.04.4/ubuntu-24.04.4-wsl-amd64.wsl';
+  const tmp = path.join(os.tmpdir(), `aksedge-ubuntu-2404-${arm64 ? 'arm64' : 'amd64'}.wsl`);
+  const installDir = path.join(process.env.LOCALAPPDATA || os.homedir(), 'WSL', DISTRO);
+  log(`>>> Downloading Ubuntu 24.04 image (${arm64 ? 'arm64' : 'amd64'}) via curl — WSL's own downloader failed`);
+  let code = await run('curl.exe', ['-fSL', '--retry', '3', '-o', tmp, url]);
+  if (code !== 0) {
+    fail(`failed to download Ubuntu image from ${url} (curl exit ${code})`);
+  }
+  fs.mkdirSync(installDir, { recursive: true });
+  log(`>>> Importing fresh distro '${DISTRO}' from the downloaded image`);
+  code = await wsl('--import', DISTRO, installDir, tmp);
+  if (code !== 0) {
+    fail(`failed to import distro '${DISTRO}' (exit ${code})`);
+  }
+}
+
 async function ensureDistro() {
   if (await distroExists()) {
     return;
@@ -164,11 +197,12 @@ async function ensureDistro() {
   log(`>>> Creating distro '${DISTRO}' from '${BASE_DISTRO}' (--no-launch)`);
   const code = await wsl('--install', BASE_DISTRO, '--name', DISTRO, '--no-launch');
   if (code !== 0) {
-    fail(`failed to create distro '${DISTRO}' (exit ${code})`);
+    log(`>>> 'wsl --install' failed (exit ${code}) — falling back to direct image download + import`);
+    await importDistro();
   }
   await capture('wsl.exe', ['-d', DISTRO, '-u', 'root', '--', 'true']); // first boot
   if (!(await distroExists())) {
-    fail(`distro '${DISTRO}' still not present after install`);
+    fail(`distro '${DISTRO}' still not present after install/import`);
   }
 }
 

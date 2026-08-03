@@ -122,6 +122,28 @@ prep_waagent_perms() {
   sudo chmod 777 /var/lib/waagent
 }
 
+prep_wsl_interop() {
+  # WSL2's systemd-binfmt flushes binfmt_misc on every VM boot/resume and flakily
+  # fails to re-register the WSLInterop handler that lets Linux run Windows .exe
+  # (cmd.exe / powershell). Without it, wslview can't open the Windows browser, so the
+  # interactive `az login` browser flow never completes (AADSTS70008). Install a
+  # systemd drop-in that re-adds WSLInterop AFTER systemd-binfmt runs, so it self-heals
+  # on every boot. Written now; takes effect after the systemd-applying restart.
+  log "[prep] Installing WSLInterop self-heal drop-in (keeps Windows-interop/wslview/az-login working)"
+  sudo mkdir -p /etc/systemd/system/systemd-binfmt.service.d
+  sudo tee /etc/systemd/system/systemd-binfmt.service.d/keep-wslinterop.conf >/dev/null <<'EOF'
+[Service]
+ExecStartPost=-/bin/sh -c '[ -e /proc/sys/fs/binfmt_misc/WSLInterop ] || echo ":WSLInterop:M::MZ::/init:PF" > /proc/sys/fs/binfmt_misc/register'
+EOF
+  sudo systemctl daemon-reload >/dev/null 2>&1 || true
+  # Also register right now (covers the case where this prep run doesn't trigger a
+  # systemd restart, so the currently-running distro regains Windows interop / wslview
+  # immediately rather than only on the next boot).
+  if [[ ! -e /proc/sys/fs/binfmt_misc/WSLInterop ]]; then
+    echo ':WSLInterop:M::MZ::/init:PF' | sudo tee /proc/sys/fs/binfmt_misc/register >/dev/null 2>&1 || true
+  fi
+}
+
 prep_boot_hardening() {
   # The deployed cluster's kubelet/containerd/CNI must survive WSL VM restarts
   # (vmIdleTimeout / sleep). Install one systemd unit that re-applies swapoff +
@@ -149,6 +171,76 @@ EOF
   sudo systemctl enable wsl-k8s-boot.service >/dev/null 2>&1 || true
 }
 
+prep_k3s_wsl_boot() {
+  # Two WSL-specific k3s bring-up fixes (see docs/wsl/k3s/k3s-wsl-troubleshooting.md).
+  # k3s.service is installed later by BMAgent (NodeInit); these drop-ins/scripts are
+  # pre-staged now and take effect once systemd loads that unit.
+  #
+  # (1) WSL boot-timeout reboot loop: WSL force-reboots the distro (RB_POWER_OFF) if
+  #     systemd's boot target isn't reached within ~10s (WaitForBootProcess). k3s is
+  #     Type=notify with TimeoutStartSec=0 and starts at boot; etcd+apiserver bootstrap
+  #     takes ~13s, so the boot target waits on it and blows past the 10s watchdog ->
+  #     reboot loop (never stabilizes; also flushes shared kernel binfmt_misc, killing
+  #     interop in other distros). Override Type=exec so systemd considers k3s "started"
+  #     as soon as the binary execs (boot completes in <2s); k3s keeps bootstrapping in
+  #     the background. BMAgent polls node readiness via kubectl, so it's unaffected.
+  #
+  # (2) Stale CNI VXLAN conflict: a leftover cilium_vxlan (from a prior Cilium/k8s
+  #     cluster on a reused distro) holds VXLAN UDP 8472, so k3s's flannel fails with
+  #     "flannel.1 ... address already in use" and k3s crash-loops. Clean stale
+  #     cilium/flannel/lxc interfaces before every k3s start via ExecStartPre.
+  #
+  # k3s-ONLY: these would be HARMFUL under k8s (the CNI cleanup deletes cilium_*
+  # interfaces that k8s uses, and the drop-in targets k3s.service which only exists on
+  # the k3s path), so gate on DISTRIBUTION=k3s.
+  if [[ "${DISTRIBUTION:-k8s}" != "k3s" ]]; then
+    log "[prep] Skipping k3s WSL boot fixes (distribution=${DISTRIBUTION:-k8s})"
+    return
+  fi
+  log "[prep] Installing k3s WSL boot fixes (Type=exec vs 10s boot watchdog; stale-CNI cleanup)"
+  sudo tee /usr/local/bin/wsl-cni-cleanup.sh >/dev/null <<'EOF'
+#!/bin/sh
+# Remove stale CNI/VXLAN interfaces that conflict with k3s flannel (UDP 8472).
+for i in cilium_vxlan cilium_host cilium_net flannel.1 flannel-v6.1 cni0; do
+  ip link delete "$i" 2>/dev/null || true
+done
+for i in $(ip -o link show 2>/dev/null | awk -F': ' '/lxc/{print $2}' | cut -d@ -f1); do
+  ip link delete "$i" 2>/dev/null || true
+done
+exit 0
+EOF
+  sudo chmod +x /usr/local/bin/wsl-cni-cleanup.sh
+  sudo mkdir -p /etc/systemd/system/k3s.service.d
+  sudo tee /etc/systemd/system/k3s.service.d/10-wsl.conf >/dev/null <<'EOF'
+[Service]
+Type=exec
+ExecStartPre=-/usr/local/bin/wsl-cni-cleanup.sh
+EOF
+  sudo systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+prep_wsl_keepalive() {
+  # Defense-in-depth for the WSL idle-termination cycle (Issue 3 in
+  # docs/wsl/k3s/k3s-wsl-troubleshooting.md): keep at least one long-running process
+  # alive in the distro so it always has work, complementing vmIdleTimeout=-1 set on the
+  # Windows side. NOTE: the most reliable pin is a persistent Windows-side
+  # `wsl -d aks-edge` holder session; this service is a lightweight in-distro backstop.
+  log "[prep] Installing wsl-keepalive systemd service (pin distro / avoid idle-termination)"
+  sudo tee /etc/systemd/system/wsl-keepalive.service >/dev/null <<'EOF'
+[Unit]
+Description=Keep the WSL distro alive (prevent idle-termination reboot loop)
+After=multi-user.target
+[Service]
+ExecStart=/bin/sh -c 'while true; do sleep 3600; done'
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
+  sudo systemctl daemon-reload >/dev/null 2>&1 || true
+  sudo systemctl enable --now wsl-keepalive.service >/dev/null 2>&1 || true
+}
+
 prep_azcli() {
   # Everything is driven through `az`; install the native Linux azure-cli so it
   # does NOT fall through to the Windows CLI via WSL interop.
@@ -167,12 +259,65 @@ prep_azcli() {
   hash -r
 }
 
+install_observability_deps() {
+  # The platform-pushed LinuxEdgeObservability / AzureEdgeLinuxTelemetryAndDiagnostics
+  # extension bundles azure-mdsd (the Geneva MDS daemon) only for x86_64. On arm64
+  # (aarch64) its Install fails with exit code 52 unless azure-mdsd is ALREADY present
+  # on the host ("not shipped with the extension for the Arm64 architecture ... must be
+  # pre-installed on the image"). Pre-install the arm64 build from the azurecore feed so
+  # the extension — and therefore EdgeMachine provisioning — succeeds.
+  # Called from run_deploy (systemd is PID 1 there), NOT prep: the mdsd postinst
+  # enables/starts a systemd service and only behaves when systemd is up.
+  local arch; arch="$(dpkg --print-architecture)"
+  if [[ "$arch" != "arm64" ]]; then
+    log "[deploy] arch=$arch — azure-mdsd is bundled by the observability extension; skipping pre-install"
+    return
+  fi
+  if dpkg -s azure-mdsd >/dev/null 2>&1; then
+    log "[deploy] azure-mdsd already installed ($(dpkg-query -W -f='${Version}' azure-mdsd)) — ok"
+    return
+  fi
+  log "[deploy] Pre-installing arm64 azure-mdsd (required by the LinuxEdgeObservability extension on aarch64)"
+  local base="https://packages.microsoft.com/repos/azurecore"
+  # Resolve the current arm64 .deb path from the noble (Ubuntu 24.04) index so we don't
+  # hard-pin a version that rots out of the pool. NOTE: awk must NOT `exit` early here —
+  # doing so closes the pipe and SIGPIPEs curl (exit 23), which under `set -euo pipefail`
+  # aborts the whole script. Read the full stream and print only the first match.
+  local relpath
+  relpath="$(curl -fsSL "$base/dists/noble/main/binary-arm64/Packages" \
+    | awk '/^Package: azure-mdsd$/{f=1} f && /^Filename:/ && !seen {print $2; seen=1; f=0}')"
+  [[ -n "$relpath" ]] || die "could not resolve azure-mdsd arm64 package from $base (noble index)"
+  # Download to a UNIQUE temp file. A fixed /tmp path can collide with a leftover owned
+  # by another user, making root's 'curl -o' fail with CURLE_WRITE_ERROR (rc=23) and
+  # abort prep — the actual bug this replaces.
+  local deb; deb="$(mktemp --suffix=.deb)" || die "could not create temp file for azure-mdsd download"
+  # shellcheck disable=SC2064
+  trap "rm -f '$deb'" RETURN
+  curl -fsSL -o "$deb" "$base/$relpath" || die "failed to download azure-mdsd from $base/$relpath"
+  sudo apt-get update
+  # The mdsd postinst enables/starts the systemd service. During prep systemd may not be
+  # PID 1 yet (the systemd-applying restart happens after prep), and we only need the
+  # binaries staged for the extension — so block service startup for this one install
+  # with a policy-rc.d shim (standard chroot/container practice), then remove it.
+  printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+  sudo chmod +x /usr/sbin/policy-rc.d
+  local install_rc=0
+  sudo apt-get install -y "$deb" || install_rc=$?
+  sudo rm -f /usr/sbin/policy-rc.d
+  [[ "$install_rc" -eq 0 ]] || die "azure-mdsd install failed (rc=$install_rc; needed by the arm64 observability extension)"
+  dpkg -s azure-mdsd >/dev/null 2>&1 || die "azure-mdsd not registered after install"
+  log "[deploy] azure-mdsd installed ($(dpkg-query -W -f='${Version}' azure-mdsd))"
+}
+
 run_prep() {
   log "=== PHASE: prep ==="
   NEEDS_RESTART=0
   prep_wsl_conf
   prep_waagent_perms
+  prep_wsl_interop
   prep_boot_hardening
+  prep_k3s_wsl_boot
+  prep_wsl_keepalive
   prep_azcli
   log "=== prep complete ==="
   if [[ "${NEEDS_RESTART:-0}" == "1" ]]; then
@@ -389,6 +534,11 @@ deploy_cluster() {
 run_deploy() {
   log "=== PHASE: deploy ==="
   verify_systemd
+  # Install arm64 azure-mdsd HERE (after verify_systemd), NOT in prep: the mdsd
+  # postinst enables/starts its systemd service, which only works cleanly once
+  # systemd is PID 1. During prep systemd isn't up yet, so the postinst's SysV
+  # fallback start hangs/fails.
+  install_observability_deps
   ensure_login
   register_providers
   install_extensions

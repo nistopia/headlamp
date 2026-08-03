@@ -128,8 +128,17 @@ function CreateAksArcOnWsl() {
   };
 
   const isK3s = String(config.DISTRIBUTION).trim().toLowerCase() === 'k3s';
+  // A local wheel override (AKSARC_WHEEL_PATH) takes precedence over the ADO build id in
+  // the deploy script, so the build id is only required when no local wheel is supplied.
+  const hasLocalWheel = Boolean(String(config.AKSARC_WHEEL_PATH).trim());
   const requiredFields: (keyof AksArcWslConfig)[] = isK3s
-    ? [...REQUIRED_FIELDS, 'AKSARC_BUILD_ID', 'CMP_SUBSCRIPTION', 'CMP_RESOURCE_GROUP', 'CMP_NAME']
+    ? [
+        ...REQUIRED_FIELDS,
+        'CMP_SUBSCRIPTION',
+        'CMP_RESOURCE_GROUP',
+        'CMP_NAME',
+        ...(hasLocalWheel ? [] : (['AKSARC_BUILD_ID'] as (keyof AksArcWslConfig)[])),
+      ]
     : REQUIRED_FIELDS;
   const missing = requiredFields.filter(f => !String(config[f]).trim());
 
@@ -219,13 +228,22 @@ function CreateAksArcOnWsl() {
 
   // Shown only when Distribution = k3s. k3s needs the pipeline-built wheel (the public
   // wheel has no --distribution/--cmp-* flags yet) and routing to a private CMP. The
-  // wheel is pulled automatically from the given ADO build's drop_Build_main artifact.
+  // wheel is pulled automatically from the given ADO build's drop_Build_main artifact,
+  // unless a local wheel path override is supplied below.
   const k3sFields: typeof fields = [
     {
       key: 'AKSARC_BUILD_ID',
       label: 'aksarc CLI build id',
-      required: true,
-      helper: 'ADO build whose wheel (with k3s/--cmp-* support) is installed automatically, e.g. 174744438.',
+      required: !hasLocalWheel,
+      helper: 'ADO build whose wheel (with k3s/--cmp-* support) is installed automatically, e.g. 174744438. Ignored when a local wheel path is set below.',
+    },
+    {
+      key: 'AKSARC_WHEEL_PATH',
+      label: 'aksarc CLI wheel path (local override, optional)',
+      helper:
+        'Optional. WSL-visible path to a locally built .whl — e.g. ' +
+        '/mnt/c/Users/<you>/aksarc-cli/aksarc-2.0.0b6-py3-none-any.whl. When set, this ' +
+        'wheel is installed instead of the build id above (takes precedence).',
     },
     { key: 'CMP_SUBSCRIPTION', label: 'CMP subscription', required: true, helper: 'Private CMP subscription id.' },
     { key: 'CMP_RESOURCE_GROUP', label: 'CMP resource group', required: true, helper: 'Private CMP resource group.' },
