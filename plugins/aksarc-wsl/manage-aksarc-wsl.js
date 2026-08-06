@@ -144,7 +144,61 @@ function capture(cmd, args) {
 }
 
 const wsl = (...args) => run('wsl.exe', args);
-const wslRoot = cmd => run('wsl.exe', ['-d', DISTRO, '-u', 'root', '--', 'bash', '-lc', cmd]);
+// Run a bash command as root inside DISTRO/runDistro. IMPORTANT: pass the
+// script base64-encoded rather than as a literal `bash -lc "<script>"` arg.
+// The literal-arg form has to survive re-quoting across the Windows spawn ->
+// wsl.exe -> Linux bash boundary, and complex scripts (nested double-quotes,
+// $(...) command substitutions, parens) do NOT survive that intact — e.g.
+// observed "syntax error near unexpected token '('" even though the JS
+// string itself was correct, because wsl.exe's own argv marshalling mangled
+// it before bash ever saw it. Base64 has no shell-special characters, so it
+// passes through every layer unchanged and is decoded back to the exact
+// original script on the other side.
+const wslRoot = cmd =>
+  run('wsl.exe', ['-d', DISTRO, '-u', 'root', '--', 'bash', '-c', `echo ${Buffer.from(cmd).toString('base64')} | base64 -d | bash -l`]);
+
+/**
+ * Launch (or confirm) a long-lived, host-side `wsl.exe` process attached to
+ * DISTRO. This is the ONLY thing that actually prevents the shared WSL2
+ * utility VM from powering itself off ~10-25s after the last attached
+ * Windows-side `wsl.exe` session disconnects — `vmIdleTimeout` in
+ * `.wslconfig` does NOT prevent this teardown (verified ineffective at both
+ * `-1` and its documented max value), and an in-guest systemd unit (e.g. a
+ * `sleep`-loop service) does not count either, because it isn't a host-side
+ * attached session. See docs/wsl/KNOWN-ISSUES.md issue #6, Cause D.
+ *
+ * Detached + unref'd so it survives after this Node process (and the
+ * Headlamp plugin invocation that spawned it) exits — otherwise the cluster
+ * would go unreachable again the moment `up`/`kubeconfig` finishes. Tracks
+ * the spawned pid in a lock file so repeated calls (e.g. every time the
+ * plugin loads the kubeconfig) don't pile up duplicate keepalive processes.
+ */
+function ensureHostKeepAliveProcess() {
+  const lockPath = path.join(os.tmpdir(), `aksarc-wsl-keepalive-${DISTRO}.pid`);
+  try {
+    const existingPid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+    if (existingPid) {
+      // process.kill(pid, 0) throws if the pid does not exist; succeeds (no-op) if it does.
+      process.kill(existingPid, 0);
+      log(`>>> Keepalive process already running (pid ${existingPid}); not starting another`);
+      return;
+    }
+  } catch (e) {
+    // No lock file, unreadable, or the pid is dead — fall through and (re)start it.
+  }
+  const child = spawn('wsl.exe', ['-d', DISTRO, '--', 'sleep', 'infinity'], {
+    windowsHide: true,
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  try {
+    fs.writeFileSync(lockPath, String(child.pid));
+  } catch (e) {
+    // Non-fatal — worst case we spawn a redundant keepalive next time.
+  }
+  log(`>>> Started a persistent 'wsl -d ${DISTRO} -- sleep infinity' keepalive process (pid ${child.pid}) so the WSL VM stays up while Headlamp is used`);
+}
 
 async function distroExists() {
   // `wsl -d <name> -- true` exits 0 iff the distro exists.
@@ -207,11 +261,18 @@ async function ensureDistro() {
 }
 
 /**
- * Keep the WSL2 utility VM alive for the whole (~40 min) deploy. Without this,
- * WSL idles the VM down after ~60s of no in-distro activity, which stops the Arc
- * agent — and the deploy's on-host AksArcPrereqs extension then wedges in
- * "Creating" because there is no agent to run it. vmIdleTimeout is a VM-level
- * (.wslconfig [wsl2]) setting, so applying a change needs a `wsl --shutdown`.
+ * Keep the WSL2 utility VM alive for the whole (~40 min) deploy, AND for as
+ * long as the user wants to keep using the cluster from Headlamp afterwards.
+ *
+ * NOTE: `vmIdleTimeout=-1` in `.wslconfig` alone is NOT sufficient — it was
+ * verified (both at `-1` and at its documented max value, 4294967295) to NOT
+ * prevent the shared WSL2 utility VM from powering itself off within
+ * ~10-25s of the last attached host-side `wsl.exe` process disconnecting.
+ * The only thing that reliably prevents this is keeping an actual `wsl.exe`
+ * process attached to the distro (see `ensureHostKeepAliveProcess`). We still
+ * set `vmIdleTimeout=-1` too (harmless, and helps in case a future WSL
+ * version fixes/honors it), but do not rely on it alone.
+ * See docs/wsl/KNOWN-ISSUES.md issue #6, Cause D, for the full investigation.
  */
 async function ensureWslKeepAlive() {
   const cfgPath = path.join(os.homedir(), '.wslconfig');
@@ -229,19 +290,19 @@ async function ensureWslKeepAlive() {
   } else {
     next = (orig.trim() ? orig.replace(/\s*$/, '') + '\n\n' : '') + '[wsl2]\nvmIdleTimeout=-1\n';
   }
-  if (next === orig) {
-    return; // already keeping the VM alive
+  if (next !== orig) {
+    try {
+      fs.writeFileSync(cfgPath, next);
+      log('>>> Set vmIdleTimeout=-1 in .wslconfig (best-effort; see keepalive process for the real fix)');
+      // Apply the VM-level setting. This restarts the WSL2 utility VM; the next wsl
+      // command re-boots the distro with the new timeout in effect.
+      await wsl('--shutdown');
+    } catch (e) {
+      log(`>>> WARN: could not write ${cfgPath} (${e.message}); continuing anyway`);
+    }
   }
-  try {
-    fs.writeFileSync(cfgPath, next);
-  } catch (e) {
-    log(`>>> WARN: could not write ${cfgPath} (${e.message}); the WSL VM may idle down mid-deploy`);
-    return;
-  }
-  log('>>> Set vmIdleTimeout=-1 in .wslconfig (keeps the WSL VM alive during the deploy)');
-  // Apply the VM-level setting. This restarts the WSL2 utility VM; the next wsl
-  // command re-boots the distro with the new timeout in effect.
-  await wsl('--shutdown');
+  // The actual fix: keep a real attached host-side session alive.
+  ensureHostKeepAliveProcess();
 }
 
 /** Copy the bundled deploy script + write the config into the distro. */
@@ -301,22 +362,159 @@ async function actionUp(config) {
   log('>>> up complete.');
 }
 
-async function actionDown(config) {
-  if (!(await distroExists())) {
-    fail(`distro '${DISTRO}' not present — nothing to delete`);
+/** Stop and remove the host-side keepalive process + its lock file, if any. */
+function stopHostKeepAliveProcess() {
+  const lockPath = path.join(os.tmpdir(), `aksarc-wsl-keepalive-${DISTRO}.pid`);
+  try {
+    const pid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+    if (pid) {
+      try {
+        process.kill(pid);
+        log(`>>> Stopped keepalive process (pid ${pid})`);
+      } catch (e) {
+        // Already dead — fine.
+      }
+    }
+  } catch (e) {
+    // No lock file — nothing to stop.
   }
+  try {
+    fs.unlinkSync(lockPath);
+  } catch (e) {
+    // Ignore if already gone.
+  }
+}
+
+async function actionDown(config) {
+  // The '${DISTRO}' distro may already be gone — e.g. a prior "Delete cluster"
+  // run got as far as `wsl --unregister` despite leaving Azure resources
+  // orphaned (the exact bug this file was just fixed for), or the user
+  // manually removed it. Azure-side cleanup still needs to run in that case,
+  // so fall back to running `az`/`azcmagent` inside BASE_DISTRO instead of
+  // hard-failing with "nothing to delete" — that message is only true for the
+  // WSL side, not the Azure side.
+  const haveAksEdge = await distroExists();
+  let runDistro = DISTRO;
+  if (!haveAksEdge) {
+    const { code: baseCode } = await capture('wsl.exe', ['-d', BASE_DISTRO, '--', 'true']);
+    if (baseCode !== 0) {
+      stopHostKeepAliveProcess();
+      fail(
+        `distro '${DISTRO}' not present, and fallback distro '${BASE_DISTRO}' is also not available — ` +
+          `cannot run 'az aksarc undeploy' to clean up Azure resources. Re-import/reinstall a distro, ` +
+          `or run 'az aksarc undeploy' manually against resource group '${config.RESOURCE_GROUP}'.`
+      );
+    }
+    log(
+      `>>> distro '${DISTRO}' is not present (likely left over from a prior incomplete teardown); ` +
+        `falling back to '${BASE_DISTRO}' to run the Azure-side cleanup (az aksarc undeploy / azcmagent disconnect)`
+    );
+    runDistro = BASE_DISTRO;
+  }
+  const wslRootOn = cmd =>
+    run('wsl.exe', ['-d', runDistro, '-u', 'root', '--', 'bash', '-c', `echo ${Buffer.from(cmd).toString('base64')} | base64 -d | bash -l`]);
   const rg = config.RESOURCE_GROUP;
-  const machine = '$(hostname -s | tr "[:upper:]" "[:lower:]")';
-  // Cluster-only delete (keep the Arc machine + any reusable infra) for a fast
-  // re-deploy loop: find the provisioned cluster in the RG and delete just it.
-  log('>>> Deleting the provisioned cluster (cluster-only; keeps Arc machine)');
-  const script =
+  const distribution = config.DISTRIBUTION || 'k8s';
+  // Full teardown, mirroring `deploy_cluster()` in setup-aks-arc-deploy.sh:
+  // `az aksarc undeploy` is the true counterpart of `az aksarc deploy` (used
+  // by `up`) — unlike `az aksarc delete` (which only deletes the provisioned
+  // cluster object), `undeploy` tears down ALL of the associated Azure
+  // resources that `deploy` created for this Arc machine (DevicePool,
+  // EdgeMachine, CustomLocation, etc.), not just the cluster. It takes the
+  // same --arc-machine-names the deploy step used (derived the same way:
+  // lower-cased short hostname) and is safe/idempotent to re-run if a prior
+  // teardown was left incomplete.
+  log('>>> Tearing down the AKS Arc deployment (az aksarc undeploy — removes all associated Azure resources, not just the cluster)');
+  // IMPORTANT: do NOT re-derive the Arc machine name via `hostname -s` here.
+  // A prior version did that and it returned an EMPTY string in some runs
+  // (root non-interactive shell / hostname quirk), which silently corrupted
+  // the whole teardown: `az aksarc undeploy` derives ALL resource names from
+  // --arc-machine-names, so an empty name made it compute wrong resource ids
+  // (e.g. "-cluster" instead of "cpc-xxxx-cluster"), 404 on each of those,
+  // and treat every 404 as "already deleted" — reporting exit 0 while
+  // leaving every real resource (cluster, DevicePool, CustomLocation,
+  // LogicalNetwork, EdgeMachine, extensions) orphaned in Azure. Instead,
+  // look up the ACTUAL registered Arc machine name from Azure itself (the
+  // same RG the cluster was deployed into), and hard-fail before calling
+  // undeploy if we can't resolve it — better to stop than to silently
+  // corrupt every derived resource name again.
+  const undeployScript =
     `set -e; az account set --subscription ${shSingleQuote(config.SUBSCRIPTION)}; ` +
-    `name=$(az aksarc list -g ${shSingleQuote(rg)} --query "[0].name" -o tsv 2>/dev/null); ` +
-    `if [ -z "$name" ]; then echo ">>> no provisioned cluster found in ${rg}"; exit 0; fi; ` +
-    `echo ">>> deleting cluster $name"; az aksarc delete -g ${shSingleQuote(rg)} -n "$name" --yes`;
-  const code = await wslRoot(script);
-  process.exit(code === null ? 1 : code);
+    `machine=$(az connectedmachine list -g ${shSingleQuote(rg)} --query "[0].name" -o tsv 2>/dev/null); ` +
+    `if [ -z "$machine" ]; then ` +
+    `  remaining=$(az resource list -g ${shSingleQuote(rg)} --query "length([])" -o tsv 2>/dev/null || echo 0); ` +
+    `  if [ "$remaining" = "0" ]; then echo ">>> no Arc machine found in ${rg} and the resource group is already empty — nothing to undeploy"; exit 0; fi; ` +
+    `  echo ">>> ERROR: could not resolve the Arc machine name in ${rg} via az connectedmachine list, but ${rg} still has $remaining resource(s) left — refusing to guess; run 'az resource list -g ${rg}' and clean up manually, or 'az aksarc undeploy' with an explicit --arc-machine-names" >&2; exit 1; fi; ` +
+    `echo ">>> Arc machine: $machine"; ` +
+    `az aksarc undeploy -g ${shSingleQuote(rg)} --arc-machine-names "$machine" ` +
+    `--distribution ${shSingleQuote(distribution)} --yes`;
+  let undeployCode = await wslRootOn(undeployScript);
+  if (undeployCode !== 0) {
+    // Per `az aksarc undeploy`'s own guidance: an EdgeMachine can be left in
+    // a transient Failed state on the first pass (still claimed by the
+    // DevicePool at the moment it's deleted) and just needs a second,
+    // idempotent run once the DevicePool is fully gone. Retry once
+    // automatically instead of leaving the user with an incomplete teardown.
+    log(`>>> az aksarc undeploy exited ${undeployCode}; retrying once (EdgeMachine may need a second pass once DevicePool is gone)`);
+    undeployCode = await wslRootOn(undeployScript);
+  }
+  if (undeployCode !== 0) {
+    fail(
+      `az aksarc undeploy failed after retry (exit ${undeployCode}) — Azure resources in ` +
+        `'${rg}' may still be partially deployed. Not proceeding to disconnect the Arc machine ` +
+        `or unregister the WSL distro; re-run "Delete cluster" once the underlying issue is fixed, ` +
+        `or run 'az aksarc undeploy' manually.`
+    );
+  }
+
+  log('>>> Disconnecting the Arc-enabled machine (deletes the Microsoft.HybridCompute machine resource in Azure)');
+  // `undeploy` tears down the DevicePool/EdgeMachine/CustomLocation resources
+  // it created, but NOT the underlying Arc machine registration itself (that
+  // was created separately by `azcmagent connect`, not `az aksarc deploy`) —
+  // so we still disconnect it explicitly to avoid leaving that resource
+  // behind. Plain `azcmagent disconnect` (no flags) reuses the already-logged-
+  // in `az` CLI session in the distro to delete the ARM resource, THEN clears
+  // local agent state. Do NOT use --force-local-only here — per `azcmagent
+  // disconnect --help` that flag deliberately skips contacting Azure and only
+  // clears local state, which would leave the Arc machine resource orphaned
+  // in the resource group — the opposite of a full teardown. Fall back to
+  // --force-local-only only if Azure is unreachable, so we still clear local
+  // state rather than leaving the agent half-torn-down.
+  //
+  // IMPORTANT: plain `azcmagent disconnect` does NOT reuse the az CLI login —
+  // it falls back to its own interactive device-code flow, which then times
+  // out in this non-interactive context (observed: "context deadline
+  // exceeded" after ~device-code timeout) and only THEN falls through to
+  // --force-local-only, leaving the Arc machine resource orphaned exactly as
+  // the flag's own warning says it will. Pass an explicit ARM access token
+  // (the same approach setup-aks-arc-deploy.sh's ensure_arc_connect() uses
+  // for `azcmagent connect`) so disconnect authenticates non-interactively
+  // too.
+  const disconnectScript =
+    `set -e; az account set --subscription ${shSingleQuote(config.SUBSCRIPTION)} >/dev/null 2>&1 || true; ` +
+    `tok=$(az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv 2>/dev/null); ` +
+    `if [ -n "$tok" ]; then azcmagent disconnect --access-token "$tok" 2>&1; else azcmagent disconnect 2>&1; fi ` +
+    `|| azcmagent disconnect --force-local-only 2>&1 ` +
+    `|| echo ">>> azcmagent disconnect failed (non-fatal; Arc machine resource may be orphaned — check the resource group)"`;
+  await wslRootOn(disconnectScript);
+
+  // Stop the host-side keepalive process BEFORE unregistering — otherwise the
+  // detached `wsl.exe -d ... sleep infinity` process would itself keep a
+  // reference/handle open on the distro we're about to delete. Only relevant
+  // if 'aks-edge' actually existed (keepalive always targets DISTRO).
+  stopHostKeepAliveProcess();
+
+  if (haveAksEdge) {
+    log(`>>> Unregistering WSL distro '${DISTRO}' (deletes its virtual disk)`);
+    const { code: unregisterCode } = await capture('wsl.exe', ['--unregister', DISTRO]);
+    if (unregisterCode !== 0) {
+      fail(`wsl --unregister ${DISTRO} failed (exit ${unregisterCode})`);
+    }
+    log('>>> down complete: cluster deleted, Arc machine disconnected, WSL distro unregistered.');
+  } else {
+    log(`>>> down complete: cluster deleted, Arc machine disconnected. (distro '${DISTRO}' was already gone.)`);
+  }
+  process.exit(0);
 }
 
 async function actionStatus(config) {
@@ -324,6 +522,9 @@ async function actionStatus(config) {
     log(`distro '${DISTRO}': NOT PRESENT`);
     return;
   }
+  // Self-heal: if a prior keepalive process died (e.g. after a Windows
+  // reboot/sleep), re-arm it whenever the user checks status.
+  ensureHostKeepAliveProcess();
   await wslRoot(
     `echo "== distro =="; ps -p 1 -o comm= | sed "s/^/init: /"; ` +
       `echo "== arc =="; azcmagent show 2>/dev/null | grep -E "Agent Status|Resource Name" || echo "not connected"; ` +
@@ -334,6 +535,10 @@ async function actionStatus(config) {
 
 /** Stream the cluster kubeconfig for Headlamp auto-load. */
 async function actionKubeconfig(config) {
+  // Self-heal here too: this is called every time the plugin (re-)registers
+  // the cluster with Headlamp, so it's the most reliable place to guarantee
+  // the VM stays reachable for the session that's about to use it.
+  ensureHostKeepAliveProcess();
   // Prefer az aksarc get-credentials (works for the RP-managed cluster); fall
   // back to the node-local admin.conf.
   const rg = config.RESOURCE_GROUP;

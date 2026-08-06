@@ -206,6 +206,19 @@ function CreateAksArcOnWsl() {
       if (action === 'up' && code === 0) {
         autoLoadCluster();
       }
+      if (action === 'down' && code === 0) {
+        // The cluster, Arc machine, and WSL distro are all gone at this
+        // point, but Headlamp's plugin API only exposes `setCluster` (add /
+        // update) — there is no `deleteCluster` counterpart a plugin can
+        // call, so we can't programmatically remove the now-dead entry from
+        // the Home page / sidebar. Tell the user exactly where to remove it.
+        append(
+          '\n>>> Cluster, Arc machine, and WSL distro were fully torn down.\n' +
+            '>>> Headlamp cannot remove a registered cluster entry from a plugin, so if the ' +
+            'cluster still shows on the Home page, remove it there via its Settings (gear icon) ' +
+            '> Delete Cluster, or it will simply show as unreachable.\n'
+        );
+      }
     });
   };
 

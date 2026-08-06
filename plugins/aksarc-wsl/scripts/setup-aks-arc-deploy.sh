@@ -63,6 +63,11 @@ AKSARC_WHEEL_PATH="${AKSARC_WHEEL_PATH:-}"
 AKSARC_BUILD_ID="${AKSARC_BUILD_ID:-}"
 AKSARC_WHEEL_URL="${AKSARC_WHEEL_URL:-https://hybridaksstorage.z13.web.core.windows.net/HybridAKS/CLI/aksarc-2.0.0b21-py3-none-any.whl}"
 VALIDATE_ONLY="${VALIDATE_ONLY:-false}"
+# Kubernetes version to pre-pull control-plane images for. `az aksarc deploy` auto-derives
+# the actual cluster version (no --kubernetes-version flag exists), so this must be kept in
+# sync with whatever version the HCI RP currently defaults to for new clusters. Override via
+# config if the RP's default version drifts and node-init starts failing on image pulls.
+K8S_VERSION="${K8S_VERSION:-1.34.3-20260204}"
 # Cluster distribution + private-CMP routing. k3s (and any private CMP) requires the
 # pipeline-built wheel that exposes --distribution/--cmp-*; the public wheel does not.
 DISTRIBUTION="${DISTRIBUTION:-k8s}"
@@ -86,6 +91,26 @@ HCIRP_ROLES=("Azure Connected Machine Resource Manager" "Azure Resource Bridge D
 log()  { echo ">>> $*"; }
 warn() { echo "WARN: $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
+
+# retry <max_attempts> <sleep_seconds> <cmd...> — runs a command, retrying with a
+# backoff on transient failures (e.g. network blips during curl download/az/azcmagent
+# calls). Logs each failed attempt; fails (returns last exit code) after exhausting
+# all attempts.
+retry() {
+  local max_attempts="$1" sleep_seconds="$2"; shift 2
+  local attempt=1 rc=0
+  while true; do
+    "$@" && return 0
+    rc=$?
+    if (( attempt >= max_attempts )); then
+      warn "  command failed after ${attempt} attempt(s) (exit ${rc}): $*"
+      return "$rc"
+    fi
+    warn "  attempt ${attempt}/${max_attempts} failed (exit ${rc}); retrying in ${sleep_seconds}s: $*"
+    sleep "$sleep_seconds"
+    attempt=$((attempt + 1))
+  done
+}
 
 # Arc machine name = the distro hostname (azcmagent registers under it).
 ARC_MACHINE_NAME="$(hostname -s | tr '[:upper:]' '[:lower:]')"
@@ -241,6 +266,93 @@ EOF
   sudo systemctl enable --now wsl-keepalive.service >/dev/null 2>&1 || true
 }
 
+prep_k8s_tools() {
+  # k3s bundles its own networking (no kubeadm/CNI preflight needed). kubeadm-based
+  # k8s BareMetal-Agent's InstallK8sDependencies shells out to `iptables -C INPUT ...`
+  # (install_k8s_dependencies.go:186) during node init, which fails with
+  # "iptables: command not found" (exit 127) on a bare WSL Ubuntu distro — real
+  # BareMetal hosts ship these preflight tools as part of their base image, WSL doesn't.
+  if [[ "${DISTRIBUTION:-k8s}" != "k8s" ]]; then
+    log "[prep] Skipping kubeadm preflight tools (distribution=${DISTRIBUTION:-k8s})"
+    return
+  fi
+  log "[prep] Installing kubeadm preflight tools (iptables/conntrack/socat/ebtables/ethtool)"
+  sudo apt-get install -y iptables conntrack socat ebtables ethtool
+}
+
+prep_apt_repos() {
+  # fluent-bit (used by prep_hci_ext_deps below) isn't in Ubuntu's default repos —
+  # add the Microsoft prod repo + the official Fluent Bit repo before installing it.
+  log "[prep] Adding Microsoft prod + Fluent Bit apt repos"
+  sudo apt-get update
+  sudo apt-get install -y ca-certificates curl apt-transport-https gpg
+
+  local deb_arch
+  deb_arch="$(dpkg --print-architecture)"
+
+  if [[ ! -f /usr/share/keyrings/microsoft-prod.gpg ]]; then
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+      | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+  fi
+  echo "deb [arch=${deb_arch} signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" \
+    | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
+
+  if [[ ! -f /usr/share/keyrings/fluentbit-keyring.gpg ]]; then
+    curl -fsSL https://packages.fluentbit.io/fluentbit.key \
+      | sudo gpg --dearmor -o /usr/share/keyrings/fluentbit-keyring.gpg
+  fi
+  echo "deb [signed-by=/usr/share/keyrings/fluentbit-keyring.gpg] https://packages.fluentbit.io/ubuntu/noble noble main" \
+    | sudo tee /etc/apt/sources.list.d/fluent-bit.list >/dev/null
+  sudo apt-get update
+}
+
+prep_hci_ext_deps() {
+  # Dependencies for the HCI extensions (BMAgent / observability) that az aksarc deploy
+  # installs onto the Arc machine. These already succeeded in prior runs when apt happened
+  # to have them cached/available, but installing them explicitly during prep avoids
+  # relying on that and keeps this script aligned with the reference WSL setup script.
+  # We do NOT install libkmpp: its only consumer was an older BMAgent extension build,
+  # the current AksArcBareMetalAgent extension no longer requires it, and Microsoft
+  # publishes no arm64 libkmpp .deb.
+  log "[prep] Installing HCI extension dependencies (BMAgent / observability)"
+  sudo apt-get install -y aspnetcore-runtime-8.0 dotnet-runtime-8.0 \
+                          fluent-bit lttng-tools liblttng-ust1 inotify-tools
+}
+
+prep_prepull_images() {
+  # kubeadm-based k8s ClusterClass hardcodes imagePullPolicy: Never (BareMetal-Agent's
+  # set_node_initjoin_config.go), so kubeadm init will NOT pull missing images at node-init
+  # time on WSL (unlike real BareMetal hosts, which use a pre-baked Azure Linux VHD with
+  # these images already local). Pre-pull them here to avoid a downstream node-init failure.
+  if [[ "${DISTRIBUTION:-k8s}" != "k8s" ]]; then
+    log "[prep] Skipping control-plane image pre-pull (k3s is a single binary)"
+    return
+  fi
+  log "[prep] Installing containerd and pre-pulling control-plane images (imagePullPolicy=Never)"
+  sudo apt-get install -y containerd
+  sudo systemctl enable --now containerd || true   # systemd may not be PID1 yet; re-ensured in deploy phase
+
+  local ver="v${K8S_VERSION%%-*}"     # 1.34.3-20260204 -> v1.34.3
+  local repo="mcr.microsoft.com/oss/v2/kubernetes"
+  local kubeadm=/tmp/kubeadm-prepull
+
+  curl -fsSL --output "$kubeadm" "https://dl.k8s.io/release/${ver}/bin/linux/amd64/kubeadm" \
+    || { warn "  failed to download kubeadm ${ver} for image pre-pull — skipping (node-init may fail on image pull)"; return; }
+  chmod +x "$kubeadm"
+
+  # Pull each image kubeadm expects (skip etcd; BMAgent rewrites the tag — pulled explicitly below).
+  "$kubeadm" config images list --kubernetes-version="${ver}" --image-repository="${repo}" | while read -r img; do
+    case "$img" in *etcd*) continue ;; esac
+    log "[prep]   pulling $img"
+    sudo ctr -n k8s.io image pull "$img"
+  done
+
+  # Explicit etcd/pause tags BMAgent's kubeadm config rewrites to.
+  sudo ctr -n k8s.io image pull mcr.microsoft.com/oss/v2/etcd-io/etcd:v3.6.7
+  sudo ctr -n k8s.io image pull mcr.microsoft.com/oss/v2/kubernetes/pause:3.9
+  rm -f "$kubeadm"
+}
+
 prep_azcli() {
   # Everything is driven through `az`; install the native Linux azure-cli so it
   # does NOT fall through to the Windows CLI via WSL interop.
@@ -319,6 +431,10 @@ run_prep() {
   prep_k3s_wsl_boot
   prep_wsl_keepalive
   prep_azcli
+  prep_k8s_tools
+  prep_apt_repos
+  prep_hci_ext_deps
+  prep_prepull_images
   log "=== prep complete ==="
   if [[ "${NEEDS_RESTART:-0}" == "1" ]]; then
     echo
@@ -450,12 +566,34 @@ ensure_rg() {
     || az group create --name "$RESOURCE_GROUP" --location "$LOCATION" --subscription "$SUBSCRIPTION" >/dev/null
 }
 
+# Resolve AZURE_VM_HOST=auto by probing IMDS (reachable through WSL NAT if the
+# Windows host is an Azure VM / Dev Box). azcmagent refuses to install/connect
+# on a host with Azure-VM DMI signals unless MSFT_ARC_TEST=true is set.
+resolve_azure_vm_host() {
+  AZURE_VM_HOST="${AZURE_VM_HOST:-auto}"
+  if [[ "$AZURE_VM_HOST" == "auto" ]]; then
+    if curl -s -m 3 -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" >/dev/null 2>&1; then
+      AZURE_VM_HOST="true";  log "[deploy] Azure-VM host detected → MSFT_ARC_TEST + IMDS blackhole enabled"
+    else
+      AZURE_VM_HOST="false"; log "[deploy] Physical host (no IMDS) → skipping MSFT_ARC_TEST/IMDS"
+    fi
+  fi
+  if [[ "$AZURE_VM_HOST" == "true" ]]; then
+    sudo ip route add blackhole 169.254.169.254 2>/dev/null || true   # idempotent (may already exist)
+  fi
+}
+
 arc_connect() {
   log "[deploy] Arc-enabling the host ($ARC_MACHINE_NAME)"
+  resolve_azure_vm_host
+  local -a arc_env=()
+  [[ "$AZURE_VM_HOST" == "true" ]] && arc_env=(env "MSFT_ARC_TEST=true")
   if ! command -v azcmagent >/dev/null 2>&1; then
     log "[deploy]   installing azcmagent"
-    curl -sSL -o /tmp/install_azcmagent.sh https://gbl.his.arc.azure.com/azcmagent-linux
-    sudo bash /tmp/install_azcmagent.sh
+    retry 3 5 curl -sSL -o /tmp/install_azcmagent.sh https://gbl.his.arc.azure.com/azcmagent-linux \
+      || die "failed to download azcmagent installer after retries"
+    retry 3 5 sudo "${arc_env[@]}" bash /tmp/install_azcmagent.sh \
+      || die "failed to install azcmagent after retries"
   fi
 
   # azcmagent auth (token or SP) — needed for both connect and any disconnect.
@@ -473,11 +611,27 @@ arc_connect() {
   # connected to a different/old RG makes the deploy fail with ParentResourceNotFound,
   # because Microsoft.HybridCompute/machines/<host> won't exist in the deploy RG.
   if azcmagent show 2>/dev/null | grep -q 'Agent Status *: *Connected'; then
-    local cur_rg cur_sub
+    local cur_rg cur_sub cur_name
     cur_rg="$(azcmagent show 2>/dev/null | grep -i 'resource group' | head -1 | sed 's/^[^:]*: *//' | tr -d '\r' | sed 's/[[:space:]]*$//')"
     cur_sub="$(azcmagent show 2>/dev/null | grep -i 'subscription id' | head -1 | sed 's/^[^:]*: *//' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+    cur_name="$(azcmagent show 2>/dev/null | grep -i '^Resource Name' | head -1 | sed 's/^[^:]*: *//' | tr -d '\r' | sed 's/[[:space:]]*$//')"
     if [[ "$cur_rg" == "$RESOURCE_GROUP" && "$cur_sub" == "$SUBSCRIPTION" ]]; then
-      log "[deploy]   azcmagent already Connected to $SUBSCRIPTION/$RESOURCE_GROUP"
+      # IMPORTANT: the Arc machine's ARM resource name is whatever it was
+      # registered under at connect time — NOT necessarily today's
+      # `hostname -s`. Microsoft.HybridCompute machine names are
+      # case-sensitive path segments, so if the host was ever connected
+      # under a different case (e.g. a stale/prior connect before the distro
+      # hostname was lower-cased), re-deriving ARC_MACHINE_NAME from
+      # `hostname -s` here would silently mismatch the real resource and
+      # every subsequent `az aksarc deploy` extension/EdgeMachine resource id
+      # built from it would 404 (HCRP404). Always trust the already-connected
+      # resource's actual name over a fresh hostname guess.
+      if [[ -n "$cur_name" && "$cur_name" != "$ARC_MACHINE_NAME" ]]; then
+        log "[deploy]   azcmagent already Connected to $SUBSCRIPTION/$RESOURCE_GROUP as '$cur_name' (hostname guess was '$ARC_MACHINE_NAME') — using the actual registered name"
+        ARC_MACHINE_NAME="$cur_name"
+      else
+        log "[deploy]   azcmagent already Connected to $SUBSCRIPTION/$RESOURCE_GROUP"
+      fi
       return
     fi
     warn "  azcmagent Connected to ${cur_sub:-?}/${cur_rg:-?}, not $SUBSCRIPTION/$RESOURCE_GROUP — reconnecting"
@@ -486,13 +640,14 @@ arc_connect() {
       || warn "  disconnect returned non-zero; continuing to connect"
   fi
 
-  sudo azcmagent connect \
+  retry 3 5 sudo "${arc_env[@]}" azcmagent connect \
     --subscription-id "$SUBSCRIPTION" \
     --resource-group  "$RESOURCE_GROUP" \
     --tenant-id       "$TENANT_ID" \
     --location        "$LOCATION" \
     --cloud           "AzureCloud" \
-    "${arc_auth[@]}"
+    "${arc_auth[@]}" \
+    || die "azcmagent connect failed after retries"
   azcmagent show | grep -q 'Agent Status *: *Connected' || die "azcmagent connect did not reach Connected"
 }
 
@@ -506,6 +661,16 @@ grant_hcirp_roles() {
     az role assignment create --assignee-object-id "$oid" --assignee-principal-type ServicePrincipal \
       --role "$role" --scope "$scope" 2>/dev/null || log "[deploy]   '$role' already assigned"
   done
+  # RBAC/RP propagation lag: role assignments and a fresh azcmagent connect are
+  # both eventually-consistent from ARM's perspective. Deploying immediately
+  # after can 404 (HCRP404) on the very first template resource
+  # (Microsoft.HybridCompute/machines/extensions AksArcPrereqs) even though the
+  # machine and role assignment both already exist and are individually
+  # queryable — observed transient, self-clears within ~30-60s. A short fixed
+  # wait here is cheaper and more reliable than relying on the caller to
+  # manually retry the whole "Create cluster" action.
+  log "[deploy]   waiting 30s for RBAC/RP propagation before deploying"
+  sleep 30
 }
 
 deploy_cluster() {
@@ -527,8 +692,26 @@ deploy_cluster() {
     return
   fi
   log "[deploy] Running az aksarc deploy (machine '$ARC_MACHINE_NAME', distribution=$DISTRIBUTION) — this can take ~40 min"
-  az aksarc deploy "${args[@]}" --yes
-  log "[deploy] DONE — cluster deploy submitted for '$ARC_MACHINE_NAME'."
+  # Only retry on the specific transient HCRP404 propagation-lag signature
+  # (recurring immediately after arc_connect/RBAC changes and self-clearing
+  # within under a minute) — NOT on genuine deploy failures, which can take
+  # ~40 min to surface and must not be blindly re-run. A blanket `retry` here
+  # would resubmit a real, slow-to-fail error 3x.
+  local out attempt
+  for attempt in 1 2 3; do
+    if out="$(az aksarc deploy "${args[@]}" --yes 2>&1)"; then
+      echo "$out"
+      log "[deploy] DONE — cluster deploy submitted for '$ARC_MACHINE_NAME'."
+      return
+    fi
+    echo "$out" >&2
+    if [[ "$attempt" -lt 3 && "$out" == *HCRP404* && "$out" == *AksArcPrereqs* ]]; then
+      warn "  transient HCRP404 on AksArcPrereqs (attempt ${attempt}/3) — RBAC/RP propagation lag; waiting 30s and retrying"
+      sleep 30
+      continue
+    fi
+    die "az aksarc deploy failed"
+  done
 }
 
 run_deploy() {
