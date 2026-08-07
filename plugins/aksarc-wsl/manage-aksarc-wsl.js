@@ -178,13 +178,31 @@ function ensureHostKeepAliveProcess() {
   try {
     const existingPid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
     if (existingPid) {
-      // process.kill(pid, 0) throws if the pid does not exist; succeeds (no-op) if it does.
+      // process.kill(pid, 0) only proves *some* process has this pid — on Windows,
+      // pids get recycled quickly, so a dead keepalive's pid can silently start
+      // pointing at a totally unrelated process (seen in practice: a stale
+      // keepalive pid got reused by `MonAgentCore`, which made this check
+      // false-positive as "still alive" forever and nothing kept the distro up).
+      // Confirm the pid is actually a wsl.exe process before trusting it.
       process.kill(existingPid, 0);
-      log(`>>> Keepalive process already running (pid ${existingPid}); not starting another`);
-      return;
+      const imageName = (
+        require('child_process')
+          .execFileSync('tasklist', ['/FI', `PID eq ${existingPid}`, '/FO', 'CSV', '/NH'], {
+            encoding: 'utf8',
+          })
+          .split(',')[0] || ''
+      ).replace(/"/g, '');
+      if (/^wsl(\.exe)?$/i.test(imageName)) {
+        log(`>>> Keepalive process already running (pid ${existingPid}); not starting another`);
+        return;
+      }
+      log(
+        `>>> Stale keepalive lock pointed at pid ${existingPid}, which is now '${imageName}' ` +
+          '(pid reused by an unrelated process) — starting a fresh keepalive'
+      );
     }
   } catch (e) {
-    // No lock file, unreadable, or the pid is dead — fall through and (re)start it.
+    // No lock file, unreadable, dead pid, or tasklist failed — fall through and (re)start it.
   }
   const child = spawn('wsl.exe', ['-d', DISTRO, '--', 'sleep', 'infinity'], {
     windowsHide: true,
