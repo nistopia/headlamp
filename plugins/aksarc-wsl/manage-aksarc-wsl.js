@@ -570,14 +570,26 @@ async function actionKubeconfig(config) {
   // the cluster with Headlamp, so it's the most reliable place to guarantee
   // the VM stays reachable for the session that's about to use it.
   ensureHostKeepAliveProcess();
-  // Prefer az aksarc get-credentials (works for the RP-managed cluster); fall
-  // back to the node-local admin.conf.
+  // Prefer the node-local admin.conf: it authenticates with a static mTLS
+  // client cert/key, so Headlamp's Go backend can use it as-is. Headlamp has
+  // no way to satisfy an interactive login prompt, so `az aksarc
+  // get-credentials`'s AAD kubeconfig (`user.exec` -> `kubelogin --login
+  // interactive`) fails there with a silent "Bad Gateway" the moment
+  // Headlamp tries to obtain a token for it (kubelogin isn't even installed
+  // on the Windows host, and even if it were, it can't complete the
+  // interactive browser flow from Headlamp's backend process). admin.conf's
+  // cert is already scoped to system:masters on this node, so no separate
+  // ServiceAccount/token needs to be minted. Fall back to az aksarc
+  // get-credentials only if the node-local file isn't present for some
+  // reason (this fallback will still hit the same AAD limitation, but is
+  // better than silently returning nothing).
   const rg = config.RESOURCE_GROUP;
   const code = await wslRoot(
-    `set -e; az account set --subscription ${shSingleQuote(config.SUBSCRIPTION)} >/dev/null 2>&1 || true; ` +
+    `if [ -r /etc/kubernetes/admin.conf ]; then cat /etc/kubernetes/admin.conf && exit 0; fi; ` +
+      `set -e; az account set --subscription ${shSingleQuote(config.SUBSCRIPTION)} >/dev/null 2>&1 || true; ` +
       `name=$(az aksarc list -g ${shSingleQuote(rg)} --query "[0].name" -o tsv 2>/dev/null); ` +
       `if [ -n "$name" ]; then az aksarc get-credentials -g ${shSingleQuote(rg)} -n "$name" --file /tmp/kc >/dev/null 2>&1 && cat /tmp/kc && exit 0; fi; ` +
-      `cat /etc/kubernetes/admin.conf`
+      `echo "ERROR: no kubeconfig source available (admin.conf missing and az aksarc get-credentials failed)" >&2; exit 1`
   );
   process.exit(code === null ? 1 : code);
 }
