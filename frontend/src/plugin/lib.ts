@@ -48,6 +48,9 @@ import { setCluster } from '../lib/k8s/api/v1/clusterApi';
  * @see {@link https://headlamp.dev/docs/latest/development/plugins/functionality/ Plugin functionality}
  */
 import { ClusterRequest } from '../lib/k8s/api/v1/clusterRequests';
+import { setStatelessConfig } from '../redux/configSlice';
+import store from '../redux/stores/store';
+import { mergeStatelessConfigState } from '../stateless';
 import Registry from './registry';
 
 /**
@@ -139,9 +142,27 @@ export abstract class Headlamp {
    * @returns a promise which completes to Headlamp's configuration (showing the list of configured clusters).
    */
   static setCluster(clusterReq: ClusterRequest) {
-    return setCluster(clusterReq).catch(e => {
-      console.error(e);
-    });
+    return setCluster(clusterReq)
+      .then(parsedConfig => {
+        // setCluster() (via the /parseKubeConfig backend route) only persists the
+        // kubeconfig server-side — it does NOT push the result into Redux the way
+        // KubeConfigLoader.tsx's manual "load kubeconfig" flow does. Without this,
+        // a plugin calling Headlamp.setCluster() (e.g. to auto-register a cluster
+        // after provisioning it) stores the kubeconfig correctly, but the new
+        // cluster silently never appears on the Home page until the app is
+        // restarted (which re-fetches stateless config from the backend on boot).
+        // Mirror KubeConfigLoader's dispatch here so all plugins get live updates.
+        if (parsedConfig?.clusters?.length > 0) {
+          const currentStatelessClusters = store.getState().config.statelessClusters;
+          store.dispatch(
+            setStatelessConfig(mergeStatelessConfigState(currentStatelessClusters, parsedConfig))
+          );
+        }
+        return parsedConfig;
+      })
+      .catch(e => {
+        console.error(e);
+      });
   }
 
   /**

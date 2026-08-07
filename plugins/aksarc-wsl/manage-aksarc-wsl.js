@@ -62,7 +62,20 @@ const KNOWN_KEYS = [
 const FORBIDDEN_RE = /[\r\n\0]/;
 
 function log(msg) {
-  process.stdout.write(msg.endsWith('\n') ? msg : msg + '\n');
+  // IMPORTANT: write progress/status messages to stderr, not stdout.
+  // `actionKubeconfig` treats ALL of the child process's stdout as the raw
+  // kubeconfig content to hand back to Headlamp (see index.tsx's
+  // autoLoadCluster(), which base64-encodes whatever it reads from stdout).
+  // Any log() call made before the actual `cat <kubeconfig>` — e.g.
+  // ensureHostKeepAliveProcess()'s ">>> Keepalive process already running..."
+  // — would otherwise land on stdout ahead of the YAML and corrupt it,
+  // making the backend's /parseKubeConfig reject it as invalid YAML (seen in
+  // practice: Headlamp.setCluster() resolving to undefined with a
+  // "SyntaxError: Unexpected token 's', "setting up"..." console error).
+  // stderr is safe here because the Headlamp plugin (index.tsx) merges both
+  // stdout and stderr into the same displayed log for the up/down/status
+  // actions, so this doesn't change what the user sees for those actions.
+  process.stderr.write(msg.endsWith('\n') ? msg : msg + '\n');
 }
 function fail(msg) {
   process.stderr.write(`ERROR: ${msg}\n`);
@@ -602,4 +615,21 @@ async function main() {
   }
 }
 
-main().catch(err => fail(err && err.stack ? err.stack : String(err)));
+main()
+  .then(() => {
+    // `scriptjs` commands are spawned as a full Electron subprocess (see
+    // app/electron/runCmd.ts -> HEADLAMP_RUN_SCRIPT / runScript()), NOT plain
+    // `node`. Under Electron the process does not exit on its own just
+    // because the event loop has drained — dangling handles left behind by
+    // things like the detached-but-still-tracked keepalive spawn, or the
+    // Electron runtime's own internal handles, can keep it alive
+    // indefinitely. actionDown/actionKubeconfig/fail() already call
+    // process.exit() explicitly for this reason, but actionUp's/actionStatus'
+    // success paths did not, so the Electron subprocess for "up" (and
+    // especially "status", which runs every time) could hang forever with no
+    // 'exit' event ever reaching Headlamp's pluginRunCommand — silently
+    // preventing autoLoadCluster() from ever running afterward. Always exit
+    // explicitly on success so every action's process reliably terminates.
+    process.exit(0);
+  })
+  .catch(err => fail(err && err.stack ? err.stack : String(err)));

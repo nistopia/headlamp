@@ -145,10 +145,13 @@ function CreateAksArcOnWsl() {
   const append = (chunk: string) => setLog(prev => prev + chunk);
 
   /**
-   * After a successful create, read the cluster's admin.conf out of the WSL
-   * distro and register it with Headlamp (Headlamp.setCluster expects a
-   * base64-encoded kubeconfig) so the new cluster shows up on the Home page and
-   * its details are browsable — no manual "Load from KubeConfig" step.
+   * Read the cluster's admin.conf out of the WSL distro and register it with
+   * Headlamp (Headlamp.setCluster expects a base64-encoded kubeconfig) so the
+   * cluster shows up on the Home page and its details are browsable — no
+   * manual "Load from KubeConfig" step. Run after "up" (new cluster) and also
+   * after "status" (re-registers a fresh kubeconfig any time the cluster is
+   * checked, so a stale/missing Home page entry self-heals without the user
+   * needing to click "up" again).
    */
   const autoLoadCluster = () => {
     if (!pluginRunCommand) {
@@ -171,8 +174,26 @@ function CreateAksArcOnWsl() {
       }
       try {
         const b64 = btoa(unescape(encodeURIComponent(kubeconfig.trim())));
+        append(`>>> Sending kubeconfig to Headlamp.setCluster() (${kubeconfig.trim().length} chars decoded)...\n`);
         Promise.resolve(Headlamp.setCluster({ kubeconfig: b64 }))
-          .then(() => append('>>> Cluster registered. Open it from the Home page.\n'))
+          .then((result: any) => {
+            append(
+              `>>> Headlamp.setCluster() result: ${JSON.stringify(result)?.slice(0, 500)}\n`
+            );
+            const parsedClusters = result?.clusters;
+            if (Array.isArray(parsedClusters) && parsedClusters.length > 0) {
+              append(
+                `>>> Cluster registered (${parsedClusters
+                  .map((c: any) => c?.name)
+                  .join(', ')}). Open it from the Home page.\n`
+              );
+            } else {
+              append(
+                '>>> setCluster() returned no parsed clusters — the kubeconfig may not have been ' +
+                  'accepted. Try "Load from KubeConfig" manually with /etc/kubernetes/admin.conf.\n'
+              );
+            }
+          })
           .catch((e: any) =>
             append(`>>> Failed to register cluster in Headlamp: ${e?.message ?? e}\n`)
           );
@@ -203,7 +224,7 @@ function CreateAksArcOnWsl() {
       setExitCode(code);
       setRunning(false);
       append(`\n>>> Process exited with code ${code}\n`);
-      if (action === 'up' && code === 0) {
+      if ((action === 'up' || action === 'status') && code === 0) {
         autoLoadCluster();
       }
       if (action === 'down' && code === 0) {
