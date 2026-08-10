@@ -216,7 +216,24 @@ function CreateAksArcOnWsl() {
     setExitCode(undefined);
     setLog(`>>> aksarc-wsl: ${action}\n`);
 
-    const payload = encodePayload(config);
+    // The k3s-only fields (wheel build id / local wheel path / private CMP routing) are only
+    // rendered when Distribution = k3s, but their defaults still live in `config` (and may be
+    // persisted in localStorage). In the public k8s flow they must NOT be sent, otherwise a
+    // stale AKSARC_BUILD_ID forces the deploy script down the internal ADO wheel path instead
+    // of the public wheel URL. Strip them for k8s so the public defaults apply.
+    const payloadConfig = isK3s
+      ? config
+      : (() => {
+          const c = { ...config };
+          c.AKSARC_BUILD_ID = '';
+          c.AKSARC_WHEEL_PATH = '';
+          c.CMP_SUBSCRIPTION = '';
+          c.CMP_RESOURCE_GROUP = '';
+          c.CMP_NAME = '';
+          return c;
+        })();
+
+    const payload = encodePayload(payloadConfig);
     const proc = pluginRunCommand('scriptjs', [SCRIPT, action, payload], {});
     proc.stdout.on('data', (d: string) => append(d));
     proc.stderr.on('data', (d: string) => append(d));
