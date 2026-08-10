@@ -74,6 +74,30 @@ DISTRIBUTION="${DISTRIBUTION:-k8s}"
 CMP_SUBSCRIPTION="${CMP_SUBSCRIPTION:-}"
 CMP_RESOURCE_GROUP="${CMP_RESOURCE_GROUP:-}"
 CMP_NAME="${CMP_NAME:-}"
+# BMAgent hot-swap (k3s only). The marketplace AksArcBareMetalAgent extension currently
+# predates the SetK3sNodeName feature (added 2026-07-30, commit a2fce4be5): without it k3s
+# registers the node with the short hostname and CAPE's SetupCloudProvider (NodeUpdate)
+# can't find the node (looks up the full AzureEdgeHost name) -> deploy fails. The SFFLinux
+# pipeline avoids this by replacing the BMAgent binary with the unified build (Step 11 of
+# recover-brownfield-edgemachine.py -> bmagent-replace-phase2.sh). We mirror that here via a
+# background watcher during the deploy. Default ON for k3s; set false to opt out. Requires
+# msazure DevOps read access from the edge's az identity.
+ENABLE_BMAGENT_HOTSWAP="${ENABLE_BMAGENT_HOTSWAP:-true}"
+ADO_RESOURCE_ID="${ADO_RESOURCE_ID:-499b84ac-1321-427f-aa17-267ca6975798}"          # Azure DevOps AAD app
+ADO_BASE_URL="${ADO_BASE_URL:-https://dev.azure.com/msazure/msk8s/_apis}"
+BMAGENT_ARTIFACT="${BMAGENT_ARTIFACT:-drop_unifiedBuild_bmagent}"
+BMAGENT_REPLACE_SCRIPT_PATH="${BMAGENT_REPLACE_SCRIPT_PATH:-/.pipelines/aksarc-bmlinux/scripts/bmagent-replace-phase2.sh}"
+# The old unified-build pipeline 428700 was renamed DO-NOT-USE and disabled; its last
+# main build (2026-04-29) predates the k3s ClusterInfo.Distribution schema (added to main
+# 2026-05-14), so the BMAgent it produced (1.0.7.165) rejects NodeInit with HTTP 400
+# "property Distribution is unsupported" and k3s never installs. Point at the LIVE Official
+# unified build 457418 on release/stable, which DOES carry Distribution + the bmagent
+# artifact. Recent OneBranch builds finish 'partiallySucceeded', which the resolver accepts.
+# Optionally pin an exact build via BMAGENT_BUILD_ID (e.g. 174401773).
+BMAGENT_BUILD_DEFINITION="${BMAGENT_BUILD_DEFINITION:-457418}"                      # Sfflinux-unified-build-Official
+BMAGENT_BUILD_BRANCH="${BMAGENT_BUILD_BRANCH:-refs/heads/release/stable}"           # branch that carries Distribution
+BMAGENT_BUILD_ID="${BMAGENT_BUILD_ID:-}"                                            # optional: pin an exact build id
+BMAGENT_EXT_GLOB="${BMAGENT_EXT_GLOB:-Microsoft.AksArcForLinux.AksArcBareMetalAgent-*}"
 # Sign-in method. Default 'browser' avoids device-code: az opens the Windows browser
 # via wslview so auth happens on the (Conditional-Access-compliant) Windows device,
 # and azcmagent reuses that token. 'sp' is fully non-interactive. 'device-code' is the
@@ -148,22 +172,38 @@ prep_waagent_perms() {
 }
 
 prep_wsl_interop() {
-  # WSL2's systemd-binfmt flushes binfmt_misc on every VM boot/resume and flakily
-  # fails to re-register the WSLInterop handler that lets Linux run Windows .exe
-  # (cmd.exe / powershell). Without it, wslview can't open the Windows browser, so the
-  # interactive `az login` browser flow never completes (AADSTS70008). Install a
-  # systemd drop-in that re-adds WSLInterop AFTER systemd-binfmt runs, so it self-heals
-  # on every boot. Written now; takes effect after the systemd-applying restart.
-  log "[prep] Installing WSLInterop self-heal drop-in (keeps Windows-interop/wslview/az-login working)"
-  sudo mkdir -p /etc/systemd/system/systemd-binfmt.service.d
-  sudo tee /etc/systemd/system/systemd-binfmt.service.d/keep-wslinterop.conf >/dev/null <<'EOF'
+  # ISOLATION so this distro can never break other WSL distros' interop.
+  # WSL2 shares ONE kernel and binfmt_misc is GLOBAL across all distros. WSL's
+  # systemd-binfmt unit unregisters+re-registers WSLInterop on every boot
+  # (echo -1 > .../WSLInterop ; echo :WSLInterop... > register). Because the table is
+  # shared, that momentarily removes the shared WSLInterop entry and re-points /init at
+  # THIS distro's namespace -> Windows interop (cmd.exe / wslview / az login browser)
+  # breaks in OTHER distros (e.g. Ubuntu-24.04). To avoid any cross-distro impact, this
+  # distro must NEVER flush/clobber the shared entry: mask systemd-binfmt here and
+  # register WSLInterop ADDITIVELY (only if missing -> never clobbers another distro's
+  # registration). The additive register also covers the first-boot case where no other
+  # distro has registered it yet, so this distro's own wslview/az-login still works.
+  log "[prep] Isolating binfmt_misc (mask systemd-binfmt + additive WSLInterop) so this distro can't break other distros' interop"
+  sudo systemctl mask systemd-binfmt.service >/dev/null 2>&1 || true
+  sudo tee /etc/systemd/system/wsl-interop-register.service >/dev/null <<'EOF'
+[Unit]
+Description=Additively register WSLInterop without flushing shared binfmt_misc (isolate other distros)
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target
 [Service]
-ExecStartPost=-/bin/sh -c '[ -e /proc/sys/fs/binfmt_misc/WSLInterop ] || echo ":WSLInterop:M::MZ::/init:PF" > /proc/sys/fs/binfmt_misc/register'
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null; [ -e /proc/sys/fs/binfmt_misc/WSLInterop ] || echo ":WSLInterop:M::MZ::/init:PF" > /proc/sys/fs/binfmt_misc/register'
+[Install]
+WantedBy=sysinit.target
 EOF
   sudo systemctl daemon-reload >/dev/null 2>&1 || true
-  # Also register right now (covers the case where this prep run doesn't trigger a
-  # systemd restart, so the currently-running distro regains Windows interop / wslview
-  # immediately rather than only on the next boot).
+  sudo systemctl enable wsl-interop-register.service >/dev/null 2>&1 || true
+  # Remove the older self-heal drop-in (it healed THIS distro but didn't stop the flush
+  # from hitting other distros); the mask above supersedes it.
+  sudo rm -f /etc/systemd/system/systemd-binfmt.service.d/keep-wslinterop.conf 2>/dev/null || true
+  # Register now too (additive; won't clobber an existing shared entry).
   if [[ ! -e /proc/sys/fs/binfmt_misc/WSLInterop ]]; then
     echo ':WSLInterop:M::MZ::/init:PF' | sudo tee /proc/sys/fs/binfmt_misc/register >/dev/null 2>&1 || true
   fi
@@ -242,6 +282,24 @@ Type=exec
 ExecStartPre=-/usr/local/bin/wsl-cni-cleanup.sh
 EOF
   sudo systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+prep_wsl_fast_stop() {
+  # Fix the WSL poweroff-hang reboot loop (Issue 3 in docs/wsl/k3s/k3s-wsl-troubleshooting.md).
+  # WSL gives `systemctl poweroff` only ~10s to finish before it force-reboots the distro
+  # (InitTerminateInstanceInternal -> reboot(RB_POWER_OFF)). systemd's DefaultTimeoutStopSec is
+  # 90s, so any slow-to-stop service (BMAgent, arcproxy, containerd, unattended-upgrades, k3s
+  # mounts) blows past WSL's 10s window -> RB_POWER_OFF -> reboot -> idle -> loop (which wipes
+  # /tmp, drops interop, and interrupts the deploy). Cap the stop/abort timeouts so shutdown
+  # always completes within WSL's window.
+  log "[prep] Capping systemd DefaultTimeoutStopSec=5s (avoid WSL 10s poweroff-hang reboot loop)"
+  sudo mkdir -p /etc/systemd/system.conf.d
+  sudo tee /etc/systemd/system.conf.d/wsl-fast-stop.conf >/dev/null <<'EOF'
+[Manager]
+DefaultTimeoutStopSec=5s
+DefaultTimeoutAbortSec=5s
+EOF
+  sudo systemctl daemon-reexec >/dev/null 2>&1 || true
 }
 
 prep_wsl_keepalive() {
@@ -429,6 +487,7 @@ run_prep() {
   prep_wsl_interop
   prep_boot_hardening
   prep_k3s_wsl_boot
+  prep_wsl_fast_stop
   prep_wsl_keepalive
   prep_azcli
   prep_k8s_tools
@@ -482,11 +541,40 @@ ensure_login() {
       # Interactive browser login (NOT device-code): az starts a localhost redirect and
       # opens the Windows default browser via wslview. Auth completes on the compliant
       # Windows device, satisfying Conditional Access; the redirect returns to WSL localhost.
+      #
+      # WSL flushes the shared-kernel binfmt_misc on distro boots (see
+      # docs/wsl/k3s/k3s-wsl-troubleshooting.md Issue 2), which removes WSLInterop and breaks
+      # wslview -> the browser login can't open and TIMES OUT. We run as root here, so
+      # (re)register WSLInterop immediately before login so wslview works regardless of boot
+      # timing.
+      if [[ ! -e /proc/sys/fs/binfmt_misc/WSLInterop ]]; then
+        log "[deploy]   WSLInterop missing -> re-registering so wslview can open the browser (Issue 2)"
+        mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
+        echo ':WSLInterop:M::MZ::/init:PF' > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+      fi
       if ! command -v wslview >/dev/null 2>&1; then
         log "[deploy]   installing wslu (provides wslview) for browser login"
         sudo apt-get update -qq && sudo apt-get install -y -qq wslu
       fi
-      BROWSER="$(command -v wslview)" az login --tenant "$TENANT_ID" --only-show-errors
+      # Browser login can HANG on multi-distro WSL2 even with interop up: the AAD localhost
+      # auth redirect doesn't return to az's listener inside this distro (Windows localhost
+      # forwarding routes to the wrong distro, or an IPv4/localhost -> IPv6/::1 mismatch), so the
+      # browser "circles" after you sign in. It's non-deterministic, so RETRY with a fresh port
+      # each attempt (device-code is intentionally NOT used here — it is blocked by CA policy).
+      # If every attempt fails, use a service principal (AUTH_MODE=sp) — no browser/redirect.
+      local _bt="${LOGIN_BROWSER_TIMEOUT:-150}" _bmax="${LOGIN_BROWSER_ATTEMPTS:-4}" _bi=1
+      while :; do
+        log "[deploy]   browser az login attempt ${_bi}/${_bmax} — complete the sign-in in the window that opens"
+        if timeout "$_bt" env BROWSER="$(command -v wslview)" az login --tenant "$TENANT_ID" --only-show-errors; then
+          break
+        fi
+        if [[ ${_bi} -ge ${_bmax} ]]; then
+          die "browser az login did not complete after ${_bmax} attempts — the localhost auth redirect isn't returning into this WSL distro. Re-run, or set AUTH_MODE=sp (service principal) for a no-redirect login."
+        fi
+        warn "[deploy]   attempt ${_bi} did not complete (redirect didn't return); retrying with a fresh port in 5s"
+        az logout >/dev/null 2>&1 || true
+        sleep 5; _bi=$((_bi + 1))
+      done
       ;;
     sp)
       [[ -n "$AZURE_CLIENT_ID" && -n "$AZURE_CLIENT_SECRET" ]] \
@@ -673,6 +761,64 @@ grant_hcirp_roles() {
   sleep 30
 }
 
+hotswap_bmagent_bg() {
+  # k3s-only: replace the marketplace BMAgent binary with the current unified build
+  # (which has SetK3sNodeName) the moment CAPE installs the extension mid-deploy, BEFORE
+  # NodeInit runs. Mirrors the SFFLinux pipeline's Step 11 (bmagent-replace-phase2.sh).
+  # Runs in the BACKGROUND alongside `az aksarc deploy`. Non-fatal: on any error it logs
+  # and exits 0 (the deploy then fails at SetupCloudProvider with the known node-name
+  # error, which points here).
+  local hlog=/tmp/bmagent-hotswap.log
+  (
+    set +e
+    echo "[hotswap] $(date -u +%FT%TZ) starting BMAgent hot-swap watcher (k3s, build def ${BMAGENT_BUILD_DEFINITION})"
+    local adotok base build url extdir
+    adotok="$(az account get-access-token --resource "$ADO_RESOURCE_ID" --query accessToken -o tsv 2>/dev/null | tr -cd '[:print:]')"
+    if [[ -z "$adotok" ]]; then
+      echo "[hotswap] ERROR: could not get an Azure DevOps token (edge identity needs msazure DevOps read). k3s node-name will NOT be set."
+      exit 0
+    fi
+    base="$ADO_BASE_URL"
+    if [[ -n "$BMAGENT_BUILD_ID" ]]; then
+      build="$BMAGENT_BUILD_ID"
+      echo "[hotswap] using pinned BMAgent build $build"
+    else
+      # OneBranch builds usually finish 'partiallySucceeded' (succeededWithIssues), so accept
+      # that alongside 'succeeded' — otherwise the resolver skips them and falls back to a
+      # stale build that predates the k3s Distribution schema (the 428700/1.0.7.165 trap).
+      build="$(curl -fsSL -H "Authorization: Bearer $adotok" \
+        "${base}/build/builds?definitions=${BMAGENT_BUILD_DEFINITION}&branchName=${BMAGENT_BUILD_BRANCH}&statusFilter=completed&resultFilter=succeeded,partiallySucceeded&\$top=1&api-version=7.0" \
+        2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['value'][0]['id'])" 2>/dev/null)"
+    fi
+    [[ -n "$build" ]] || { echo "[hotswap] ERROR: no BMAgent unified build found (def ${BMAGENT_BUILD_DEFINITION}, branch ${BMAGENT_BUILD_BRANCH})"; exit 0; }
+    echo "[hotswap] resolved BMAgent unified build: $build (def ${BMAGENT_BUILD_DEFINITION}, branch ${BMAGENT_BUILD_BRANCH})"
+    url="$(curl -fsSL -H "Authorization: Bearer $adotok" \
+      "${base}/build/builds/${build}/artifacts?artifactName=${BMAGENT_ARTIFACT}&api-version=7.0" \
+      2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['resource']['downloadUrl'])" 2>/dev/null)"
+    [[ -n "$url" ]] || { echo "[hotswap] ERROR: artifact ${BMAGENT_ARTIFACT} not found on build $build"; exit 0; }
+    curl -fsSL -H "Authorization: Bearer $adotok" -o /tmp/bmagent-staged.zip "$url" \
+      || { echo "[hotswap] ERROR: artifact download failed"; exit 0; }
+    curl -fsSL -H "Authorization: Bearer $adotok" \
+      "${base}/git/repositories/Aks-Arc-Assembly/items?path=${BMAGENT_REPLACE_SCRIPT_PATH}&versionType=branch&version=main&api-version=7.0" \
+      -o /tmp/bmagent-replace-phase2.sh || { echo "[hotswap] ERROR: replace-script download failed"; exit 0; }
+    head -1 /tmp/bmagent-replace-phase2.sh | grep -q '^#!' || { echo "[hotswap] ERROR: replace-script looks invalid"; exit 0; }
+    echo "[hotswap] staged unified build $build; waiting for CAPE to install the BMAgent extension..."
+    extdir=""
+    for _ in $(seq 1 240); do   # up to ~20 min
+      extdir="$(find /var/lib/waagent/ -maxdepth 1 -type d -name "$BMAGENT_EXT_GLOB" 2>/dev/null | sort -V | tail -1)"
+      [[ -n "$extdir" ]] && break
+      sleep 5
+    done
+    [[ -n "$extdir" ]] || { echo "[hotswap] ERROR: BMAgent extension never appeared within ~20m"; exit 0; }
+    echo "[hotswap] extension present ($extdir) -> replacing binary NOW (before NodeInit)"
+    bash /tmp/bmagent-replace-phase2.sh \
+      && echo "[hotswap] DONE: BMAgent binary replaced with unified build $build" \
+      || echo "[hotswap] ERROR: bmagent-replace-phase2.sh failed (see output above)"
+  ) >>"$hlog" 2>&1 &
+  local pid=$!
+  log "[deploy] BMAgent hot-swap watcher launched (k3s; pid $pid; log $hlog) — swaps to unified build def ${BMAGENT_BUILD_DEFINITION} before NodeInit"
+}
+
 deploy_cluster() {
   local -a args=(-g "$RESOURCE_GROUP" --arc-machine-names "$ARC_MACHINE_NAME" --subscription "$SUBSCRIPTION")
   # Only pass --distribution/--cmp-* when opting into k3s or a private CMP — these flags
@@ -728,6 +874,15 @@ run_deploy() {
   ensure_rg
   arc_connect
   grant_hcirp_roles
+  # k3s marketplace BMAgent panics/crash-loops on NodeInit (see
+  # docs/wsl/k3s/k3s-wsl-troubleshooting.md Issue 6). Launch the hot-swap watcher BEFORE
+  # deploy_cluster so it replaces the marketplace binary with the unified build the moment
+  # CAPE installs the extension (before NodeInit). Gated on k3s + ENABLE_BMAGENT_HOTSWAP.
+  if [[ "$DISTRIBUTION" == "k3s" && "$ENABLE_BMAGENT_HOTSWAP" == "true" ]]; then
+    hotswap_bmagent_bg
+  else
+    log "[deploy] BMAgent hot-swap skipped (DISTRIBUTION=$DISTRIBUTION, ENABLE_BMAGENT_HOTSWAP=$ENABLE_BMAGENT_HOTSWAP)"
+  fi
   deploy_cluster
   log "=== deploy complete ==="
 }
