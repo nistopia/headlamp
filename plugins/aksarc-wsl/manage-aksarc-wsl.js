@@ -445,7 +445,6 @@ async function actionDown(config) {
   const wslRootOn = cmd =>
     run('wsl.exe', ['-d', runDistro, '-u', 'root', '--', 'bash', '-c', `echo ${Buffer.from(cmd).toString('base64')} | base64 -d | bash -l`]);
   const rg = config.RESOURCE_GROUP;
-  const distribution = config.DISTRIBUTION || 'k8s';
   // Full teardown, mirroring `deploy_cluster()` in setup-aks-arc-deploy.sh:
   // `az aksarc undeploy` is the true counterpart of `az aksarc deploy` (used
   // by `up`) — unlike `az aksarc delete` (which only deletes the provisioned
@@ -477,8 +476,11 @@ async function actionDown(config) {
     `  if [ "$remaining" = "0" ]; then echo ">>> no Arc machine found in ${rg} and the resource group is already empty — nothing to undeploy"; exit 0; fi; ` +
     `  echo ">>> ERROR: could not resolve the Arc machine name in ${rg} via az connectedmachine list, but ${rg} still has $remaining resource(s) left — refusing to guess; run 'az resource list -g ${rg}' and clean up manually, or 'az aksarc undeploy' with an explicit --arc-machine-names" >&2; exit 1; fi; ` +
     `echo ">>> Arc machine: $machine"; ` +
-    `az aksarc undeploy -g ${shSingleQuote(rg)} --arc-machine-names "$machine" ` +
-    `--distribution ${shSingleQuote(distribution)} --yes`;
+    // `az aksarc undeploy` is distribution-agnostic — it derives every resource
+    // from -g + --arc-machine-names. It does NOT accept --distribution (only
+    // `deploy` does, and only the k3s pipeline wheel exposes that flag), so
+    // passing it makes undeploy fail with "unrecognized arguments: --distribution".
+    `az aksarc undeploy -g ${shSingleQuote(rg)} --arc-machine-names "$machine" --yes`;
   let undeployCode = await wslRootOn(undeployScript);
   if (undeployCode !== 0) {
     // Per `az aksarc undeploy`'s own guidance: an EdgeMachine can be left in
