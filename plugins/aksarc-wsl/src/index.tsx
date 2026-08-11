@@ -58,6 +58,7 @@ interface AksArcWslConfig {
   TENANT_ID: string;
   LOCATION: string;
   DISTRIBUTION: string;
+  ENABLE_GPU: string;
   CMP_SUBSCRIPTION: string;
   CMP_RESOURCE_GROUP: string;
   CMP_NAME: string;
@@ -72,6 +73,7 @@ const DEFAULT_CONFIG: AksArcWslConfig = {
   TENANT_ID: '',
   LOCATION: 'eastus',
   DISTRIBUTION: 'k8s',
+  ENABLE_GPU: 'false',
   CMP_SUBSCRIPTION: '',
   CMP_RESOURCE_GROUP: '',
   CMP_NAME: '',
@@ -357,6 +359,26 @@ function CreateAksArcOnWsl() {
             >
               <MenuItem value="k8s">k8s (public managed CMP)</MenuItem>
               <MenuItem value="k3s">k3s (private CMP)</MenuItem>
+            </TextField>
+          </Grid>
+
+          <Grid item xs={12} sm={6}>
+            <TextField
+              select
+              fullWidth
+              size="small"
+              label="GPU"
+              helperText={
+                isK3s
+                  ? 'GPU enablement is k8s-only (k3s embeds its own containerd).'
+                  : 'Expose an NVIDIA GPU to the cluster (device plugin). No-op if none.'
+              }
+              value={config.ENABLE_GPU}
+              onChange={e => setField('ENABLE_GPU', e.target.value)}
+              disabled={running || isK3s}
+            >
+              <MenuItem value="false">Off</MenuItem>
+              <MenuItem value="true">Enable GPU (Kubernetes device plugin)</MenuItem>
             </TextField>
           </Grid>
 

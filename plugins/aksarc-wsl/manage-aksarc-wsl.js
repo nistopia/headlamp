@@ -51,6 +51,7 @@ const KNOWN_KEYS = [
   'AKSARC_BUILD_ID',
   'AKSARC_WHEEL_URL',
   'DISTRIBUTION',
+  'ENABLE_GPU',
   'CMP_SUBSCRIPTION',
   'CMP_RESOURCE_GROUP',
   'CMP_NAME',
@@ -340,10 +341,14 @@ async function ensureWslKeepAlive() {
 async function stage(config) {
   const scriptWin = path.join(__dirname, 'scripts', 'setup-aks-arc-deploy.sh');
   const scriptWsl = winToWslPath(scriptWin);
+  const gpuWin = path.join(__dirname, 'scripts', 'enable-gpu-wsl.sh');
+  const gpuWsl = winToWslPath(gpuWin);
   log('>>> Staging deploy script + config into WSL');
   let code = await wslRoot(
     `mkdir -p ${STAGE} && cp ${shSingleQuote(scriptWsl)} ${STAGE}/setup-aks-arc-deploy.sh && ` +
-      `sed -i 's/\\r$//' ${STAGE}/setup-aks-arc-deploy.sh && chmod +x ${STAGE}/setup-aks-arc-deploy.sh`
+      `cp ${shSingleQuote(gpuWsl)} ${STAGE}/enable-gpu-wsl.sh && ` +
+      `sed -i 's/\\r$//' ${STAGE}/setup-aks-arc-deploy.sh ${STAGE}/enable-gpu-wsl.sh && ` +
+      `chmod +x ${STAGE}/setup-aks-arc-deploy.sh ${STAGE}/enable-gpu-wsl.sh`
   );
   if (code !== 0) {
     fail('failed to stage the deploy script into WSL');

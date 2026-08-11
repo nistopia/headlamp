@@ -1,9 +1,12 @@
 # AKS Arc on WSL — Headlamp plugin
 
 Create an **AKS Arc** (SFF / BareMetal edge) cluster that uses **WSL2 as the edge
-node**, directly from the Headlamp UI. The plugin drives the hardened
-`aks-arc-on-wsl.ps1` orchestrator (bundled in `scripts/`) instead of
+node**, directly from the Headlamp UI. The plugin drives `manage-aksarc-wsl.js` →
+`setup-aks-arc-deploy.sh` (`az aksarc deploy` / `undeploy`) instead of
 reimplementing the WSL/`az` bring-up logic.
+
+> **Just want to create a cluster?** See the **[User Guide](./USER-GUIDE.md)** —
+> prerequisites, the form fields, k8s vs k3s, GPU, actions, and troubleshooting.
 
 ## Requirements
 

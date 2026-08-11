@@ -83,6 +83,9 @@ CMP_NAME="${CMP_NAME:-}"
 # background watcher during the deploy. Default ON for k3s; set false to opt out. Requires
 # msazure DevOps read access from the edge's az identity.
 ENABLE_BMAGENT_HOTSWAP="${ENABLE_BMAGENT_HOTSWAP:-true}"
+# Expose an NVIDIA GPU to the cluster after deploy (k8s device plugin). Default off;
+# no-op if there's no GPU. k8s (kubeadm) only — k3s embeds its own containerd.
+ENABLE_GPU="${ENABLE_GPU:-false}"
 ADO_RESOURCE_ID="${ADO_RESOURCE_ID:-499b84ac-1321-427f-aa17-267ca6975798}"          # Azure DevOps AAD app
 ADO_BASE_URL="${ADO_BASE_URL:-https://dev.azure.com/msazure/msk8s/_apis}"
 BMAGENT_ARTIFACT="${BMAGENT_ARTIFACT:-drop_unifiedBuild_bmagent}"
@@ -860,6 +863,25 @@ deploy_cluster() {
   done
 }
 
+# Optional — expose the GPU to Kubernetes when ENABLE_GPU=true (runs the staged
+# enable-gpu-wsl.sh: container-toolkit -> containerd -> device plugin -> verify).
+# k8s only; no-ops if there's no GPU. Skipped in validate/dry-run mode.
+deploy_gpu() {
+  [[ "$VALIDATE_ONLY" == "true" ]] && return 0
+  if [[ "${ENABLE_GPU,,}" != "true" ]]; then
+    log "[deploy] ENABLE_GPU=$ENABLE_GPU — skipping GPU enablement"
+    return 0
+  fi
+  if [[ "$DISTRIBUTION" == "k3s" ]]; then
+    warn "[deploy] ENABLE_GPU=true but GPU enablement is k8s-only (k3s embeds its own containerd) — skipping"
+    return 0
+  fi
+  local gpu_script; gpu_script="$(dirname "$0")/enable-gpu-wsl.sh"
+  [[ -f "$gpu_script" ]] || die "ENABLE_GPU=true but $gpu_script not found (must be staged alongside this script)"
+  log "[deploy] ENABLE_GPU=true — enabling GPU for Kubernetes"
+  bash "$gpu_script" --kubeconfig /etc/kubernetes/admin.conf
+}
+
 run_deploy() {
   log "=== PHASE: deploy ==="
   verify_systemd
@@ -884,6 +906,7 @@ run_deploy() {
     log "[deploy] BMAgent hot-swap skipped (DISTRIBUTION=$DISTRIBUTION, ENABLE_BMAGENT_HOTSWAP=$ENABLE_BMAGENT_HOTSWAP)"
   fi
   deploy_cluster
+  deploy_gpu
   log "=== deploy complete ==="
 }
 
