@@ -94,6 +94,9 @@ resources:
     nvidia.com/gpu: 1
 ```
 
+> Want to serve an **LLM** on the GPU? See
+> [§9 — Deploy an LLM with Foundry Local](#9-deploy-an-llm-with-foundry-local-optional).
+
 ---
 
 ## 6. Actions
@@ -133,7 +136,147 @@ wsl -d <distro> -- sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get nodes -
 
 ---
 
-## 9. Delete / tear down
+## 9. Deploy an LLM with Foundry Local (optional)
+
+Once the cluster is up **with GPU enabled** (node shows `nvidia.com/gpu`), you can
+serve an OpenAI-compatible LLM on the GPU with **Foundry Local**. This is a manual
+follow-on — the plugin doesn't do it for you. All commands run **inside `aks-edge`
+as root** (`wsl -d aks-edge -u root`), against `/etc/kubernetes/admin.conf`.
+
+> Full reference (with rationale for every step): `docs/wsl/k8s/wsl-gpu-foundry-local.md`
+> in the `Aks-Arc-Assembly` repo. Two fixes below are **required, not optional**:
+> the model-store `chmod 777` and — on **multi-GPU hosts** — the SIGPIPE patch.
+
+Let `KC=/etc/kubernetes/admin.conf` in each shell.
+
+### 9.1 cert-manager (operator dependency)
+
+Easiest via the Arc extension (needs your connected-cluster name + RG —
+`az connectedk8s list -o table`):
+
+```bash
+az k8s-extension create --cluster-name "<ARC_CLUSTER>" --name azure-cert-manager \
+  --resource-group "<RG>" --cluster-type connectedClusters \
+  --extension-type Microsoft.CertManagement --scope cluster --release-train stable \
+  --config config.enableGatewayAPI=true --config cert-manager.crds.keep=true \
+  --config trust-manager.defaultPackage.enabled=false \
+  --config trust-manager.secretTargets.enabled=true \
+  --config trust-manager.secretTargets.authorizedSecretsAll=true
+# first time only: az provider register --namespace Microsoft.KubernetesConfiguration
+kubectl --kubeconfig $KC get pods -n cert-manager   # cert-manager, cainjector, webhook, trust-manager Running
+```
+
+### 9.2 Storage for the model-store
+
+WSL has no CSI driver, so supply a default StorageClass + a hostPath PV:
+
+```bash
+kubectl --kubeconfig $KC apply -f - <<'EOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-storage
+  annotations: { storageclass.kubernetes.io/is-default-class: "true" }
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+EOF
+sudo mkdir -p /mnt/foundry-models
+kubectl --kubeconfig $KC apply -f - <<'EOF'
+apiVersion: v1
+kind: PersistentVolume
+metadata: { name: foundry-model-store-pv }
+spec:
+  capacity: { storage: 100Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  hostPath: { path: /mnt/foundry-models }
+EOF
+```
+
+### 9.3 Foundry Local operator + REQUIRED hostPath fix
+
+```bash
+# helm if missing: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | sudo bash
+helm --kubeconfig $KC upgrade --install inference-operator \
+  oci://mcr.microsoft.com/microsoft.foundry/foundrylocalenabledbyarc/helmcharts/helm/inference-operator \
+  --version 0.260430.8 --namespace foundry-local-operator --create-namespace \
+  --set entraAuth.enabled=false --set global.telemetry.enabled=false --wait --timeout 10m
+
+# REQUIRED: hostPath ignores fsGroup, so the model-store can't write without this
+sudo chmod -R 777 /mnt/foundry-models
+kubectl --kubeconfig $KC rollout restart deploy/inference-operator-model-store -n foundry-local-operator
+kubectl --kubeconfig $KC get pods -n foundry-local-operator   # operator, model-store, telemetry Running
+```
+
+### 9.4 Deploy a model on GPU
+
+```bash
+kubectl --kubeconfig $KC apply -f - <<'EOF'
+apiVersion: foundrylocal.azure.com/v1
+kind: ModelDeployment
+metadata: { name: qwen-coder-gpu, namespace: foundry-local-operator }
+spec:
+  displayName: "Qwen2.5 Coder 0.5B (GPU)"
+  model: { catalog: { name: "qwen2.5-coder-0.5b" } }
+  workloadType: generative
+  compute: gpu
+  runtime: onnx-genai
+  replicas: 1
+  resources:
+    requests: { cpu: "500m", memory: "2Gi" }
+    limits:   { cpu: "4000m", memory: "4Gi", gpu: 1 }
+EOF
+```
+
+The operator caches the model (a few min), then creates the serving Deployment.
+
+#### ⚠️ REQUIRED on multi-GPU hosts (e.g. 2× A2) — SIGPIPE patch
+
+The GPU image's `startup.sh` runs `nvidia-smi --query-gpu ... | head -1` under
+`set -euo pipefail`; with 2+ GPUs `head` closes the pipe after line 1 → SIGPIPE →
+the `inference` container crash-loops at exit 141. Patch it once the serving
+Deployment exists:
+
+```bash
+DEP=qwen-coder-gpu
+for i in $(seq 1 120); do kubectl --kubeconfig $KC get deploy "$DEP" -n foundry-local-operator >/dev/null 2>&1 && break; sleep 5; done
+# confirm 'inference' is container 0:
+kubectl --kubeconfig $KC get deploy $DEP -n foundry-local-operator -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}'
+kubectl --kubeconfig $KC patch deploy $DEP -n foundry-local-operator --type=json -p='[
+  {"op":"add","path":"/spec/template/spec/containers/0/command","value":["/bin/bash","-c",
+   "cp /usr/local/bin/startup.sh /tmp/s.sh && sed -i \"s/set -euo pipefail/set -eu/\" /tmp/s.sh && exec /bin/bash /tmp/s.sh"]}]'
+kubectl --kubeconfig $KC rollout status deploy/$DEP -n foundry-local-operator --timeout=180s
+```
+
+> The kopf operator may revert this patch on reconcile — if the pod crash-loops
+> again at 141, re-apply it. Verify the model is on the GPU:
+> `POD=$(kubectl --kubeconfig $KC get pods -n foundry-local-operator --no-headers | awk '/qwen-coder-gpu/{print $1; exit}'); kubectl --kubeconfig $KC exec $POD -c inference -n foundry-local-operator -- nvidia-smi --query-gpu=name,memory.used --format=csv,noheader`
+> — expect one GPU with non-zero memory in use.
+
+### 9.5 Send a prompt
+
+```bash
+NS=foundry-local-operator; DEP=qwen-coder-gpu
+API_KEY=$(kubectl --kubeconfig $KC get secret ${DEP}-api-keys -n $NS -o jsonpath='{.data.primary-key}' | base64 -d)
+kubectl --kubeconfig $KC port-forward svc/${DEP} 5000:5000 -n $NS >/tmp/pf.log 2>&1 &
+pf_pid=$!; sleep 3
+curl -sS --insecure https://localhost:5000/v1/chat/completions \
+  -H "api-key: ${API_KEY}" -H "Content-Type: application/json" \
+  -d '{"model":"qwen2.5-coder-0.5b","messages":[{"role":"user","content":"Write a Python function to reverse a string."}],"max_tokens":120}' | python3 -m json.tool
+kill "$pf_pid" 2>/dev/null
+```
+
+A response with `finish_reason: "stop"` and a `model` of `...-cuda-gpu:*` confirms
+the full round-trip: prompt → Foundry Local → model on the GPU → OpenAI reply.
+
+> **No GPU / CPU fallback:** deploy with `compute: cpu` + `runtime: onnx-genai`
+> (model resolves the `...-generic-cpu` variant); no SIGPIPE patch needed.
+
+---
+
+## 10. Delete / tear down
 
 **Delete cluster** runs `az aksarc undeploy` — the true counterpart of deploy —
 which removes **all** associated Azure resources (cluster, DevicePool,
@@ -143,7 +286,7 @@ second pass after the DevicePool is gone). The WSL distro is kept.
 
 ---
 
-## 10. Where things live
+## 11. Where things live
 
 | What | Where |
 |------|-------|
